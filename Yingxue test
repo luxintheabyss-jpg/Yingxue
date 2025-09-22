@@ -1222,7 +1222,7 @@ globalThis.YINGXUE_QUICK_STATUS = function() {
   if (primary) console.log(`${primary.name}: rel ${primary.rel || 0}, int ${primary.int || 0}, traits: ${primary.traits.join(', ')}`); 
 };
 
-YX_HELPERS.log('YINGXUE v3.2c patched loaded (multi-detect, safer pronouns, enhancer cooldown, modes & actions resilience)');
+YX_HELPERS.log('YINGXUE v1.0 patched loaded (multi-detect, safer pronouns, enhancer cooldown, modes & actions resilience)');
 
 // ---------- Ephemeral / Prune Patch (drop-in) ----------
 (function(){
