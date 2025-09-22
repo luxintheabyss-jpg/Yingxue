@@ -1,1701 +1,1680 @@
-// ===== Library: Yingxue Ultimate+ Core (Automated, Robust, AI Dungeon Integrated) ===== //
-// Drop into Library. Idempotent, stateful via AI Dungeon's 'state'. Exposes YG_LIB.api for mods. //
-// Features: Memory (salience/prune/TTL/digests), Entities (auto/aliases/merge/decay/relations), Compact Context, //
-// Cadence Events (cues/decay/time/weather/inventory prune), Translations (queue/batch/auto-mode), StoryCard (auto-sync), Plugins (hooks/toggles). //
-// Inventory/Health (parse/update), Fame/Infamy (auto-bump). //
-// Added: Smarter Intent Parser v2 for input heuristics (intents like combat, flirt, etc.) //
-// Added: Semantic pruning via embedding proxy, Narrative digest summary, Deeper state-based logic with rule engines
-(function(){
-  if(typeof YG_LIB === "undefined") YG_LIB = {};
-  YG_LIB.api = YG_LIB.api || {};
+// YINGXUE v1.0 — Merged Framework (Patched: system tags, init order, name extraction, hint caps, compact memory, emotional momentum, enhancers, modes & actions resilience)
 
-  // Configuration (tweak via /settings where possible)
-  YG_LIB.CONFIG = YG_LIB.CONFIG || {
-    TTL: { short: 6, medium: 60, long: 999999 },
-    SALIENCE_WEIGHTS: { lengthFactor: 0.8, mentionFactor: 5, flagFactor: 10, fameInfamyFactor: 0.2 },
-    CONTEXT_TARGET_CHARS: 1400,
-    EVENT_CADENCE: { minor: 10, mid: 50, major: 100 },
-    ENTITY_CAP_DETECTION_MINLEN: 2,
-    ENTITY_STRICTNESS: "gentle",
-    AUTO_STORYCARD_ENABLED: true,
-    MEMORY_MAX: 500,
-    ENTITY_CREATE_RATE_LIMIT: 4,
-    ENTITY_DECAY_TURNS: 50,
-    TRANSLATE_BATCH_MAX: 10,
-    DIGEST_TURN_INTERVAL: 5,
-    HEALTH_PRUNE_THRESHOLD: 400,
-    TIME_ADVANCE_CHANCE: 0.3,
-    WEATHER_CHANGE_CHANCE: 0.2,
-    INVENTORY_MAX: 20,
-    SEMANTIC_PRUNE_THRESHOLD: 5,
-    DIGEST_TURN_WINDOW: 10,
-    // PHASE1: Added for new settings
-    MAX_INPUT_CHARS: 350,
-    ENTITY_AUTO_CREATE_AFTER: 5
-  };
+try { if (typeof state === 'undefined' || state === null) state = {}; } catch (e) { globalThis.state = globalThis.state || {}; }
 
-  // Small helpers
-  YG_LIB.truncate = (s,n=120) => !s ? "" : (s.length>n ? s.slice(0,n-1)+"…" : s);
-  YG_LIB.randChance = p => Math.random() < p;
-  YG_LIB.now = () => (YG_STATE && YG_STATE.turns) ? YG_STATE.turns : 0;
-  YG_LIB.escapeRegex = s => (s||"").replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+// ---------------- Core State (defaults) ---------------- 
+if (!state.yingxue) { 
+  state.yingxue = { 
+    config: { 
+      logToConsole: true, 
+      debug: false, 
+      systemMode: 'compact', // 'compact' | 'verbose' | 'minimal' 
+      systemTag: 's',       // use <s> ... </s> by default for AI Dungeon compatibility 
+      maxSystemHints: 6, 
+      maxSystemChars: 700, 
+      perspective: 'second', // 'first' | 'second' — toggle for pronoun normalization 
+      compactMode: true,     // reduces memory footprint when true 
+      intimateEnhancers: true, // enables sensory mood triggers 
+      emotionalMomentum: true, // enables momentum tracking 
+      handleModes: false, // NEW: allow mode handling (see/say/story)
 
-  // Ensure core state (robust, with fallbacks)
-  YG_LIB.api.ensureState = function(){
-    if(typeof YG_STATE === "undefined") YG_STATE = {};
-    YG_STATE.turns = YG_STATE.turns || 0;
-    YG_STATE.timeOfDay = YG_STATE.timeOfDay || "dusk";
-    YG_STATE.weather = YG_STATE.weather || "clear";
-    YG_STATE.location = YG_STATE.location || "unknown";
-    YG_STATE.fame = typeof YG_STATE.fame === "number" ? YG_STATE.fame : 0;
-    YG_STATE.infamy = typeof YG_STATE.infamy === "number" ? YG_STATE.infamy : 0;
-    YG_STATE.maxHealth = YG_STATE.maxHealth || 100;
-    YG_STATE.playerHealth = typeof YG_STATE.playerHealth === "number" ? YG_STATE.playerHealth : YG_STATE.maxHealth;
-    YG_STATE.inventory = YG_STATE.inventory || [];
-    YG_STATE.currentGoals = YG_STATE.currentGoals || [];
-    YG_STATE.companions = YG_STATE.companions || [];
-    YG_STATE._turnSummaryBuffer = YG_STATE._turnSummaryBuffer || [];
-    YG_STATE._archivedSummaries = YG_STATE._archivedSummaries || [];
-    YG_STATE.memory = YG_STATE.memory || {};
-    YG_STATE._memoryIndex = YG_STATE._memoryIndex || { byId:[], byTag:{}, byEntity:{}, nextId:1 };
-    YG_STATE.entities = YG_STATE.entities || {};
-    YG_STATE._entityIndex = YG_STATE._entityIndex || { byName:{}, byAlias:{}, nextId:1 };
-    YG_STATE.storyCard = YG_STATE.storyCard || {};
-    YG_STATE.settings = YG_STATE.settings || { entityStrictness: YG_LIB.CONFIG.ENTITY_STRICTNESS, translateAll:false, translateAuto:false, plugins:{} };
-    YG_STATE.dirty = YG_STATE.dirty || {};
-    YG_STATE._entityCreateCount = YG_STATE._entityCreateCount || 0;
-    YG_STATE._translateQueue = YG_STATE._translateQueue || [];
-    YG_STATE.aliasSuggestions = YG_STATE.aliasSuggestions || [];
-    YG_STATE.flags = YG_STATE.flags || { storyFlags: {}, battleFlags: {}, relationshipFlags: {} };
-    YG_STATE.currentAttempts = YG_STATE.currentAttempts || [];
-    YG_STATE.currentDialogues = YG_STATE.currentDialogues || [];
-    YG_STATE.attemptHistory = YG_STATE.attemptHistory || [];
-    YG_STATE.settings.maxInputChars = YG_STATE.settings.maxInputChars || YG_LIB.CONFIG.MAX_INPUT_CHARS;
-    YG_STATE.settings.entityAutoCreateAfter = YG_STATE.settings.entityAutoCreateAfter || YG_LIB.CONFIG.ENTITY_AUTO_CREATE_AFTER;
-    return YG_STATE;
-  };
+      attemptPatterns: {
+        intimate: '\\b(kiss|caress|touch|hold|embrace|stroke|nuzzle|cuddle|lean into|move closer)\\b',
+        emotional: '\\b(confess|admit|reveal|share|open up|trust|vulnerable|honest)\\b',
+        social: '\\b(persuade|convince|charm|flirt|seduce|tease|compliment|reassure)\\b',
+        assertive: '\\b(demand|insist|confront|challenge|push|force|grab|pull)\\b',
+        risky: '\\b(attack|fight|threaten|hurt|destroy|kill|strike|hit)\\b'
+      },
 
-  // Tiny lemmatizer + verb detector (improved with more irregulars)
-  YG_LIB.IRREG = { ran:"run", went:"go", gone:"go", ate:"eat", seen:"see", saw:"see", took:"take", taken:"take", was:"be", were:"be", had:"have" };
-  YG_LIB.lemmatize = w => {
-    if(!w) return "";
-    const lw = w.toLowerCase();
-    if(YG_LIB.IRREG[lw]) return YG_LIB.IRREG[lw];
-    if(lw.endsWith("ing")&&lw.length>4) return lw.slice(0,-3);
-    if(lw.endsWith("ed")&&lw.length>3) return lw.slice(0,-2);
-    if(lw.endsWith("es")&&lw.length>3) return lw.slice(0,-2);
-    if(lw.endsWith("s")&&lw.length>3) return lw.slice(0,-1);
-    return lw;
-  };
-  YG_LIB.VERB_HOT = ["look","enter","open","search","take","run","sneak","speak","whisper","cast","invoke","attack","steal","hide","escape","climb","read","write","study","heal","trade","buy","sell","ask","answer","listen","observe","examine","touch","light","jump","kick","throw","drop","inspect","repair","break","lock","unlock","summon","fight","defend","explore"];
-  YG_LIB.detectVerbsTiny = function(text){
-    if(!text) return [];
-    const toks = (text||"").toLowerCase().split(/\W+/).filter(Boolean);
-    const found = [];
-    for(const t of toks){
-      const lem = YG_LIB.lemmatize(t);
-      if(YG_LIB.VERB_HOT.includes(lem)) found.push(lem);
-      else if(t.match(/\w+(ing|ed|es)$/)) found.push(lem);
-    }
-    return Array.from(new Set(found)).slice(0,6);
-  };
+      fillerWords: ['um', 'uh', 'er'], // Refined: Only pure stutters; removed 'like', 'just', etc. to avoid over-cleaning
+      tension: {
+        decayRate: 0.5,
+        buildRate: 1.5,
+        maxTension: 10,
+        minTension: -5,
+        decayEveryN: 2 // optional: apply decay every N turns; 0 means every turn
+      },
 
-  // Keyword groups for flags and goals
-  YG_LIB.KEYMAP = {
+      timeCycle: {
+        phases: ['Dawn', 'Morning', 'Noon', 'Afternoon', 'Evening', 'Night'],
+        ticksPerPhase: 4,
+        advanceOn: 'locationChange' // or 'input'
+      },
+
+      engagement: {
+        decayPerTurn: 1,
+        min: -3,
+        max: 8,
+        attemptBoost: 2,
+        passivePenalty: 1
+      },
+
+      proactivity: {
+        level: 1,
+        allowPhysical: false,
+        triggerThreshold: -2,
+        moodBursts: ['whispered confession', 'lingering gaze']
+      },
+
+      authorNotes: {
+        enabled: true,
+        mode: 'adaptive', // 'adaptive' | 'off'
+        maxLength: 200
+      }
+    },
+
+    // runtime
+    turn: 0,
+    currentLocation: null,
+    currentMood: 'neutral',
+    playerStatus: [],
+    engagement: 0,
+    timeIndex: 0,
+    lastActionType: null,
+    lastActionTypes: [],
+    lastInputDepth: 'basic',
+
+    lastSubtext: { detected: false, types: [], confidence: 0 },
+
+    characters: {},
+    relationshipTension: 0,
+    currentScene: {
+      primaryCharacter: null,
+      mood: 'neutral',
+      intimacyLevel: 0,
+      emotionalTension: 0
+    },
+
     flags: {
-      inCombat: ["fight","battle","attack","enemy","slash","combat","defend"],
-      resting: ["rest","sleep","nap","recover","heal"],
-      alerted: ["alert","warn","danger","watch","listen","observe"],
-      exploring: ["explore","search","investigate","look","examine","inspect"]
+      locationChanged: false,
+      authorNoteSent: false,
+      _lastEnhancerTurn: -999,
+      isSeeMode: false,
+      lastPlayerAction: 'turn',
+      lastOutputText: '',
+      stateStack: [],
+      lastInputText: ''
     },
-    goals: {
-      "Find ancient relic": ["find relic","find the relic","ancient relic","seek relic"],
-      "Escape the dungeon": ["escape the dungeon","escape","flee","get out"],
-      "Learn new magic": ["learn magic","study magic","practice spell","learn spell"],
-      "Defeat the boss": ["defeat boss","kill enemy","conquer"]
+
+    metrics: {
+      totalTurns: 0,
+      authorNotesSent: 0,
+      locationChanges: 0
     },
-    fame: ["heroic","brave","save","rescue","victory"],
-    infamy: ["evil","betray","steal","murder","destroy"]
-  };
-  YG_LIB.scoreKeywordGroups = function(text, groups){
-    const res = {};
-    if(!text || !groups) return res;
-    const lower = text.toLowerCase();
-    for(const [k, arr] of Object.entries(groups)){
-      let score = 0;
-      for(const kw of arr){
-        if(lower.includes(kw.toLowerCase())) score += 1;
-      }
-      res[k] = score;
-    }
-    return res;
-  };
 
-  // Salience computation
-  YG_LIB.computeSalience = function({ text="", mentions=1, hasFlag=false }){
-    YG_LIB.api.ensureState();
-    const len = (text||"").length;
-    const lengthScore = Math.min(10, Math.floor(len / 80) * YG_LIB.CONFIG.SALIENCE_WEIGHTS.lengthFactor);
-    const mentionScore = mentions * YG_LIB.CONFIG.SALIENCE_WEIGHTS.mentionFactor;
-    const flagScore = hasFlag ? YG_LIB.CONFIG.SALIENCE_WEIGHTS.flagFactor : 0;
-    const fameInfamy = ((YG_STATE.fame||0) + (YG_STATE.infamy||0)) * YG_LIB.CONFIG.SALIENCE_WEIGHTS.fameInfamyFactor;
-    const base = lengthScore + mentionScore + flagScore + fameInfamy;
-    return Math.max(1, Math.min(100, Math.round(base)));
-  };
+    emotionalMomentum: { type: null, strength: 0, decay: 0.6 },
+    _initialized: false,
+    _cacheVersion: 0
 
-  // Memory manager
-  YG_LIB.addMemory = function({ text="", tier="short", tags=[], kind="note", source="player", salience=null, entity=null }){
-    YG_LIB.api.ensureState();
-    const id = YG_STATE._memoryIndex.nextId++;
-    const mentions = 1;
-    const hasFlag = !!(YG_STATE.flags && Object.keys(YG_STATE.flags.storyFlags||{}).length);
-    const computed = (typeof salience === "number") ? salience : YG_LIB.computeSalience({ text, mentions, hasFlag });
-    const now = YG_LIB.now();
-    const ttl = YG_LIB.CONFIG.TTL[tier] || YG_LIB.CONFIG.TTL.short;
-    const entry = { id, text, zh: null, zhPending: false, tier, kind, source, salience: computed, mentions, tags: tags.slice(), entity: entity || null, createdTurn: now, lastSeenTurn: now, expiresAt: (ttl>0 ? now + ttl : Infinity) };
-    YG_STATE.memory[id] = entry;
-    YG_STATE._memoryIndex.byId.push(id);
-    for(const t of tags){
-      YG_STATE._memoryIndex.byTag[t] = YG_STATE._memoryIndex.byTag[t]||[];
-      YG_STATE._memoryIndex.byTag[t].push(id);
-    }
-    if(entry.entity){
-      YG_STATE._memoryIndex.byEntity[entry.entity] = YG_STATE._memoryIndex.byEntity[entry.entity]||[];
-      YG_STATE._memoryIndex.byEntity[entry.entity].push(id);
-    }
-    YG_STATE.dirty.memory = true;
-    // Debug trace for last memory
-    YG_STATE._lastMemory = { id: id, text: YG_LIB.truncate(text, 500), tier: tier, createdTurn: now };
-    YG_STATE.dirty._lastMemory = true;
-    // Auto-queue translate if translateAll
-    if(YG_STATE.settings.translateAll) YG_LIB.api.queueTranslateToChinese(id);
-    return entry;
-  };
+  }; 
+}
 
-  YG_LIB.pruneMemories = function(){
-    YG_LIB.api.ensureState();
-    const now = YG_LIB.now();
-    const toDelete = [];
-    for(const id of (YG_STATE._memoryIndex.byId||[])){
-      const m = YG_STATE.memory[id];
-      if(!m) continue;
-      if(m.tier !== "long" && m.expiresAt <= now) toDelete.push(id);
-    }
-    // Prune if exceeding max memories by lowest salience
-    const MAX_MEM = YG_LIB.CONFIG.MEMORY_MAX || 500;
-    let currentCount = Object.keys(YG_STATE.memory || {}).length - toDelete.length;
-    if(currentCount > MAX_MEM){
-      const rem = Object.values(YG_STATE.memory).filter(e => !toDelete.includes(e.id)).sort((a,b)=>a.salience - b.salience);
-      while(currentCount > MAX_MEM && rem.length){
-        toDelete.push(rem.shift().id);
-        currentCount--;
-      }
-    }
-    // Semantic pruning on top of that
-    const semanticDeleted = YG_LIB.api.pruneSemanticRedundancies(YG_LIB.CONFIG.SEMANTIC_PRUNE_THRESHOLD);
-    toDelete.push(...semanticDeleted);
+// ---------------- Cache Rebuild (defined early) ---------------- 
+globalThis.YINGXUE_REBUILD_CACHE = function() { 
+  try { 
+    const cfg = state.yingxue?.config || {}; 
+    const patterns = cfg.attemptPatterns || {};
 
-    if(toDelete.length){
-      for(const id of toDelete){
-        delete YG_STATE.memory[id];
-        const idx = (YG_STATE._memoryIndex.byId||[]).indexOf(id);
-        if(idx>=0) YG_STATE._memoryIndex.byId.splice(idx,1);
-        for(const k in YG_STATE._memoryIndex.byTag){
-          YG_STATE._memoryIndex.byTag[k] = (YG_STATE._memoryIndex.byTag[k]||[]).filter(i => i !== id);
-          if(!YG_STATE._memoryIndex.byTag[k].length) delete YG_STATE._memoryIndex.byTag[k];
-        }
-        for(const k in YG_STATE._memoryIndex.byEntity){
-          YG_STATE._memoryIndex.byEntity[k] = (YG_STATE._memoryIndex.byEntity[k]||[]).filter(i => i !== id);
-          if(!YG_STATE._memoryIndex.byEntity[k].length) delete YG_STATE._memoryIndex.byEntity[k];
-        }
-      }
-      YG_STATE.dirty.memory = true;
-      log(`Pruned ${toDelete.length} memories (incl. semantic).`, "info");
-    }
-    return toDelete.length;
-  };
-
-  YG_LIB.getTopMemories = function({ top=6, tier=null, entity=null } = {}){
-    YG_LIB.api.ensureState();
-    let arr = Object.values(YG_STATE.memory||{});
-    if(tier) arr = arr.filter(m => m.tier === tier);
-    if(entity) arr = arr.filter(m => m.entity === entity);
-    arr.sort((a,b) => b.salience - a.salience || b.lastSeenTurn - a.lastSeenTurn);
-    return arr.slice(0, top);
-  };
-
-  // Build compact context (includes health, inventory, goals, flags, memories, input meta)
-  YG_LIB.buildCompactContext = function({ includeMemoryTop=3 } = {}){
-    YG_LIB.api.ensureState();
-    const parts = [];
-    parts.push(`T:${YG_STATE.turns||0}`);
-    parts.push(`TOD:${(YG_STATE.timeOfDay||"unk").slice(0,6)}`);
-    parts.push(`W:${(YG_STATE.weather||"unk").slice(0,6)}`);
-    parts.push(`L:${(YG_STATE.location||"unk").replace(/\s+/g,"_").slice(0,40)}`);
-    parts.push(`HP:${YG_STATE.playerHealth||0}/${YG_STATE.maxHealth||100}`);
-    parts.push(`INV:${YG_STATE.inventory.slice(0,5).join(",") || "empty"}`);
-    parts.push(`LA:${YG_LIB.truncate(YG_STATE.lastAction||"none",70)}`);
-    parts.push(`LO:${YG_LIB.truncate(YG_STATE.lastOutcome||"",70)}`);
-    if(YG_STATE.currentGoals && YG_STATE.currentGoals.length) parts.push(`G:${YG_STATE.currentGoals.slice(0,4).map(g=>g.replace(/\s+/g,"_")).join(",")}`);
-    const flags = Object.keys((YG_STATE.flags && YG_STATE.flags.storyFlags)||{}).filter(k=>YG_STATE.flags.storyFlags[k]);
-    if(flags.length) parts.push(`F:${flags.slice(0,6).join(",")}`);
-    parts.push(`R:F${YG_STATE.fame||0}|I${YG_STATE.infamy||0}`);
-    const top = YG_LIB.getTopMemories({ top: includeMemoryTop });
-    if(top && top.length){
-      const memStr = top.map(m => `m${m.id}:${YG_LIB.truncate(m.text,50)}`).join(" | ");
-      parts.push(`M:${memStr}`);
-    }
-    if(YG_STATE._lastInputMeta) {
-      const lm = YG_STATE._lastInputMeta;
-      parts.push(`IN:${lm.inputType||"raw"}|PV:${(lm.verbs||[])[0]||"none"}|EM:${lm.emotion||"neutral"}`);
-    }
-    let ctx = `===YCTX===\n${parts.join(" | ")}\n===END===`;
-    if(ctx.length > YG_LIB.CONFIG.CONTEXT_TARGET_CHARS){
-      ctx = ctx.slice(0, YG_LIB.CONFIG.CONTEXT_TARGET_CHARS - 30) + "\n===END===";
-    }
-    return ctx;
-  };
-
-  // Entity canonicalization (auto-add/alias/merge with relations)
-  YG_LIB.api.getEntityByNameOrAlias = function(name){
-    if(!name) return null;
-    YG_LIB.api.ensureState();
-    const lower = name.trim().toLowerCase();
-    const idx = YG_STATE._entityIndex || {};
-    const byName = idx.byName && idx.byName[lower] ? idx.byName[lower] : null;
-    const byAlias = idx.byAlias && idx.byAlias[lower] ? idx.byAlias[lower] : null;
-    const id = byName || byAlias;
-    if(id && YG_STATE.entities[id]) return YG_STATE.entities[id];
-    return null;
-  };
-
-  YG_LIB.api.addEntity = function({ canonicalName, aliases = [], type = "unknown", createdBy = "auto", note = "", relations = {} }){
-    YG_LIB.api.ensureState();
-    if(!canonicalName || !canonicalName.trim()) return null;
-    const name = canonicalName.trim();
-    const existing = YG_LIB.api.getEntityByNameOrAlias(name);
-    if(existing){
-      const mergedAliases = new Set([...(existing.aliases||[]), ...(aliases||[])]);
-      existing.aliases = Array.from(mergedAliases);
-      existing.type = existing.type || type;
-      existing.note = (existing.note || "") + (note ? ("\n" + note) : "");
-      existing.lastSeenTurn = YG_STATE.turns || existing.lastSeenTurn || 0;
-      existing.relations = { ...(existing.relations || {}), ...relations };
-      YG_STATE.dirty.entities = true;
-      return existing;
-    }
-    YG_STATE._entityCreateCount = YG_STATE._entityCreateCount || 0;
-    if(YG_STATE._entityCreateCount >= YG_LIB.CONFIG.ENTITY_CREATE_RATE_LIMIT && createdBy === "auto"){
-      YG_STATE.aliasSuggestions = YG_STATE.aliasSuggestions || [];
-      YG_STATE.aliasSuggestions.push({ suggestedName: name, note: "rate-limited auto-create", turn: YG_STATE.turns });
-      YG_STATE.dirty.aliasSuggestions = true;
-      return null;
-    }
-    const id = "E" + (YG_STATE._entityIndex.nextId++);
-    const now = YG_STATE.turns || 0;
-    const ent = {
-      id,
-      canonicalName: name,
-      aliases: Array.from(new Set([name, ...(aliases||[])])),
-      type: type || "unknown",
-      firstSeenTurn: now,
-      lastSeenTurn: now,
-      mentions: 0,
-      salience: 1,
-      createdBy,
-      note: note || "",
-      inactive: false,
-      relations: relations || {}
-    };
-    YG_STATE.entities[id] = ent;
-    YG_STATE._entityIndex.byName = YG_STATE._entityIndex.byName || {};
-    YG_STATE._entityIndex.byAlias = YG_STATE._entityIndex.byAlias || {};
-    YG_STATE._entityIndex.byName[name.toLowerCase()] = id;
-    for(const a of ent.aliases){
-      if(a && typeof a === "string") YG_STATE._entityIndex.byAlias[a.toLowerCase()] = id;
-    }
-    YG_STATE._entityCreateCount = (YG_STATE._entityCreateCount || 0) + 1;
-    YG_STATE.dirty.entities = true;
-    return ent;
-  };
-
-  YG_LIB.api.mentionEntity = function(nameOrId, { text=null, salienceDelta=0 } = {}){
-    YG_LIB.api.ensureState();
-    let ent = null;
-    if(!nameOrId) return null;
-    if(typeof nameOrId === "string" && nameOrId[0] === "E" && YG_STATE.entities[nameOrId]) ent = YG_STATE.entities[nameOrId];
-    else ent = YG_LIB.api.getEntityByNameOrAlias(nameOrId) || null;
-    if(!ent){
-      if(YG_STATE.settings.entityStrictness === "strict") return null;
-      if(YG_STATE.settings.entityStrictness === "ask"){
-        YG_STATE.aliasSuggestions = YG_STATE.aliasSuggestions || [];
-        YG_STATE.aliasSuggestions.push({ suggestedName: nameOrId, text: text || "", turn: YG_STATE.turns });
-        YG_STATE.dirty.aliasSuggestions = true;
-        return null;
-      }
-      ent = YG_LIB.api.addEntity({ canonicalName: nameOrId, aliases:[nameOrId], createdBy:"auto", note:"autocreated from mention" });
-      if(!ent) return null;
-    }
-    ent.mentions = (ent.mentions || 0) + 1;
-    ent.lastSeenTurn = YG_STATE.turns || ent.lastSeenTurn || 0;
-    ent.salience = Math.min(9999, (ent.salience||0) + Math.max(1, salienceDelta || 1));
-    ent.inactive = false;
-    if(text && text.length && YG_LIB.addMemory){
-      YG_LIB.addMemory({ text: `[entity:${ent.id}] ${YG_LIB.truncate(text,160)}`, tier:"short", tags:["entity","auto"], kind:"entity-mention", source:"auto", entity: ent.canonicalName });
-    }
-    YG_STATE.dirty.entities = true;
-    return ent;
-  };
-
-  YG_LIB.api.addAliasToEntity = function(idOrName, alias){
-    YG_LIB.api.ensureState();
-    if(!alias) return { ok:false, msg:"alias empty" };
-    let ent = null;
-    if(typeof idOrName === "string" && idOrName[0] === "E" && YG_STATE.entities[idOrName]) ent = YG_STATE.entities[idOrName];
-    else ent = YG_LIB.api.getEntityByNameOrAlias(idOrName);
-    if(!ent) return { ok:false, msg:"entity not found" };
-    if(!ent.aliases.includes(alias)) ent.aliases.push(alias);
-    YG_STATE._entityIndex.byAlias = YG_STATE._entityIndex.byAlias || {};
-    YG_STATE._entityIndex.byAlias[alias.toLowerCase()] = ent.id;
-    YG_STATE.dirty.entities = true;
-    return { ok:true, id: ent.id, aliases: ent.aliases };
-  };
-
-  YG_LIB.api.mergeEntities = function(primaryIdOrName, secondaryIdOrName){
-    YG_LIB.api.ensureState();
-    const a = (typeof primaryIdOrName === "string" && primaryIdOrName[0] === "E") ? YG_STATE.entities[primaryIdOrName] : YG_LIB.api.getEntityByNameOrAlias(primaryIdOrName);
-    const b = (typeof secondaryIdOrName === "string" && secondaryIdOrName[0] === "E") ? YG_STATE.entities[secondaryIdOrName] : YG_LIB.api.getEntityByNameOrAlias(secondaryIdOrName);
-    if(!a || !b) return { ok:false, msg:"one or both entities not found" };
-    if(a.id === b.id) return { ok:true, msg:"same entity", id:a.id };
-    const aliasSet = new Set([...(a.aliases||[]), ...(b.aliases||[])]);
-    a.aliases = Array.from(aliasSet);
-    a.mentions = (a.mentions||0) + (b.mentions||0);
-    a.salience = Math.max(a.salience||0, b.salience||0) + Math.floor((b.salience||0)/4);
-    a.note = (a.note||"") + "\n[merged from " + b.id + "] " + (b.note||"");
-    a.firstSeenTurn = Math.min(a.firstSeenTurn || 999999, b.firstSeenTurn || 999999);
-    a.lastSeenTurn = Math.max(a.lastSeenTurn || 0, b.lastSeenTurn || 0);
-    a.relations = { ...(a.relations || {}), ...(b.relations || {}) };
-    for(const al of a.aliases) YG_STATE._entityIndex.byAlias[al.toLowerCase()] = a.id;
-    if(a.canonicalName) YG_STATE._entityIndex.byName[a.canonicalName.toLowerCase()] = a.id;
-    delete YG_STATE.entities[b.id];
-    for(const k in YG_STATE._entityIndex.byAlias){
-      if(YG_STATE._entityIndex.byAlias[k] === b.id) delete YG_STATE._entityIndex.byAlias[k];
-    }
-    for(const k in YG_STATE._entityIndex.byName){
-      if(YG_STATE._entityIndex.byName[k] === b.id) delete YG_STATE._entityIndex.byName[k];
-    }
-    YG_STATE.dirty.entities = true;
-    return { ok:true, primary: a.id, removed: b.id };
-  };
-
-  YG_LIB.api.addRelation = function(idOrName1, idOrName2, type){
-    let ent1 = YG_LIB.api.getEntityByNameOrAlias(idOrName1) || YG_STATE.entities[idOrName1];
-    let ent2 = YG_LIB.api.getEntityByNameOrAlias(idOrName2) || YG_STATE.entities[idOrName2];
-    if(!ent1 || !ent2) return { ok:false, msg:"entity not found" };
-    ent1.relations[ent2.id] = type;
-    ent2.relations[ent1.id] = type; // symmetric for now
-    YG_STATE.dirty.entities = true;
-    return { ok:true };
-  };
-
-  // Auto canonicalize text to entities
-  YG_LIB.api.autoCanonicalizeText = function(text, { createIfMissing=true } = {}){
-    YG_LIB.api.ensureState();
-    if(!text) return [];
-    // Regex for multi-word TitleCase or quoted names
-    const regex = /(?:"([^"]+)"|\b[A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,}){0,3}\b)/g;
-    const matches = text.match(regex) || [];
-    const tokens = matches.map(m => m.replace(/"/g, ''));
-    const results = [];
-    for(const tok of tokens){
-      if(/^(The|A|An|I|He|She|They|We|It|And|Or|But|Of|In|On|At)$/.test(tok)) continue;
-      if(tok.length < YG_LIB.CONFIG.ENTITY_CAP_DETECTION_MINLEN) continue;
-      const found = YG_LIB.api.getEntityByNameOrAlias(tok);
-      if(found){
-        YG_LIB.api.mentionEntity(found.id, { text });
-        results.push(found);
-        continue;
-      }
-      const strict = YG_STATE.settings && YG_STATE.settings.entityStrictness ? YG_STATE.settings.entityStrictness : YG_LIB.CONFIG.ENTITY_STRICTNESS;
-      if(strict === "strict"){
-        continue;
-      }
-      if(strict === "ask"){
-        YG_STATE.aliasSuggestions.push({ suggestedName: tok, text: text||"", turn: YG_STATE.turns });
-        YG_STATE.dirty.aliasSuggestions = true;
-        continue;
-      }
-      if(createIfMissing){
-        const ent = YG_LIB.api.addEntity({ canonicalName: tok, aliases:[tok], createdBy:"auto", note:"auto-created" });
-        if(ent){
-          YG_LIB.api.mentionEntity(ent.id, { text, salienceDelta:2 });
-          results.push(ent);
-        }
-      }
-    }
-    return results;
-  };
-
-  // Queue translation to Chinese
-  YG_LIB.api.queueTranslateToChinese = function(memoryId){
-    YG_LIB.api.ensureState();
-    if(!YG_STATE.memory || !YG_STATE.memory[memoryId]) return { ok:false, msg:"no such memory" };
-    YG_STATE.memory[memoryId].zhPending = true;
-    if(!YG_STATE._translateQueue.includes(memoryId)) YG_STATE._translateQueue.push(memoryId);
-    YG_STATE.dirty.memory = true;
-    return { ok:true, id:memoryId };
-  };
-
-  YG_LIB.api.generateTranslationBatchPrompt = function(){
-    YG_LIB.api.ensureState();
-    const q = (YG_STATE._translateQueue||[]).slice(0, YG_LIB.CONFIG.TRANSLATE_BATCH_MAX);
-    if(!q.length) return null;
-    const items = q.map(id => {
-      const m = YG_STATE.memory[id] || {};
-      return { id: m.id, original: m.text || "" };
-    });
-    const prompt = [
-      "You are a precise translator. Translate the following to Simplified Chinese (简体中文).",
-      "Return ONLY a JSON array: [{\"id\":123, \"zh\":\"translated text\"}, ...]",
-      "No extra text or explanations.",
-      JSON.stringify(items, null, 2)
-    ].join("\n\n");
-    return prompt;
-  };
-
-  // Cadence events & decay (time, weather, inventory prune, entity inactivity)
-  YG_LIB.checkCadenceEvents = function(){
-    YG_LIB.api.ensureState();
-    const t = YG_STATE.turns || 0;
-    if(t <= 0) return;
-
-    if(t % YG_LIB.CONFIG.EVENT_CADENCE.minor === 0){
-      YG_STATE.narrativeSummary = (YG_STATE.narrativeSummary || "") + `\nA subtle change ripples through the ${YG_STATE.location || "surroundings"}.`;
-      YG_STATE.dirty.narrativeSummary = true;
-
-      // Advance time weather
-      if(YG_LIB.randChance(YG_LIB.CONFIG.TIME_ADVANCE_CHANCE)){
-        const times = ["dawn", "morning", "noon", "afternoon", "dusk", "night"];
-        const currIdx = times.indexOf(YG_STATE.timeOfDay) || 0;
-        YG_STATE.timeOfDay = times[(currIdx + 1) % times.length];
-        YG_STATE.dirty.timeOfDay = true;
-      }
-      if(YG_LIB.randChance(YG_LIB.CONFIG.WEATHER_CHANGE_CHANCE)){
-        const weathers = ["clear", "rainy", "stormy", "foggy", "snowy"];
-        YG_STATE.weather = weathers[Math.floor(Math.random() * weathers.length)];
-        YG_STATE.dirty.weather = true;
-      }
-    }
-
-    if(t % YG_LIB.CONFIG.EVENT_CADENCE.mid === 0){
-      if(!YG_STATE.flags.storyFlags.rumor && YG_LIB.randChance(0.45)){
-        YG_STATE.flags.storyFlags.rumor = true;
-        YG_STATE.narrativeSummary += `\nRumors begin to thread through the ${YG_STATE.location || "area"}.`;
-        YG_STATE.dirty.flags = true;
-        YG_STATE.dirty.narrativeSummary = true;
-      }
-      // Prune inventory if over max
-      if(YG_STATE.inventory.length > YG_LIB.CONFIG.INVENTORY_MAX){
-        const dropped = YG_STATE.inventory.shift();
-        YG_STATE.narrativeSummary += `\nYou drop ${dropped} due to encumbrance.`;
-        YG_STATE.dirty.inventory = true;
-        YG_STATE.dirty.narrativeSummary = true;
-      }
-    }
-
-    if(t % YG_LIB.CONFIG.EVENT_CADENCE.major === 0){
-      if(YG_STATE.fame > 10 && YG_LIB.randChance(0.6)){
-        YG_STATE.narrativeSummary += `\nSomeone influential has noticed recent happenings.`;
-        YG_STATE.flags.storyFlags["opportunity"] = true;
-        YG_STATE.dirty.flags = true;
-        YG_STATE.dirty.narrativeSummary = true;
-      } else if(YG_STATE.infamy > 10 && YG_LIB.randChance(0.6)){
-        YG_STATE.narrativeSummary += `\nShadows gather: your name is muttered in fearful tones.`;
-        YG_STATE.flags.storyFlags["menace"] = true;
-        YG_STATE.dirty.flags = true;
-        YG_STATE.dirty.narrativeSummary = true;
-      } else {
-        YG_STATE.narrativeSummary += `\nA turning point ripples just beyond the horizon.`;
-        YG_STATE.dirty.narrativeSummary = true;
-      }
-      // Fame/infamy decay
-      if(YG_STATE.fame > 0) {
-        YG_STATE.fame = Math.max(0, YG_STATE.fame - 1);
-        YG_STATE.dirty.fame = true;
-      }
-      if(YG_STATE.infamy > 0) {
-        YG_STATE.infamy = Math.max(0, YG_STATE.infamy - 1);
-        YG_STATE.dirty.infamy = true;
-      }
-    }
-
-    // Entity inactivity decay
-    const decayCut = (YG_STATE.turns || 0) - YG_LIB.CONFIG.ENTITY_DECAY_TURNS;
-    for(const id of Object.keys(YG_STATE.entities||{})){
-      const e = YG_STATE.entities[id];
-      if(e && typeof e.lastSeenTurn === "number" && e.lastSeenTurn < decayCut){
-        e.inactive = true;
-        YG_STATE.dirty.entities = true;
-      }
-    }
-  };
-
-  // Plugin registration (enable/disable)
-  YG_LIB.plugins = YG_LIB.plugins || {};
-  YG_LIB.registerPlugin = function(name, hooks){
-    YG_LIB.plugins = YG_LIB.plugins || {};
-    YG_LIB.plugins[name] = { enabled: true, hooks: hooks || {} };
-    return YG_LIB.plugins[name];
-  };
-  YG_LIB.runHook = function(hookName, ...args){
-    YG_LIB.api.ensureState();
-    for(const [k,v] of Object.entries(YG_LIB.plugins||{})){
-      try{
-        if(v.enabled && v.hooks && typeof v.hooks[hookName] === "function"){
-          v.hooks[hookName].apply(null, args);
-        }
-      }catch(e){
-        v.enabled = false;
-        YG_STATE.dirty.plugins = true;
-        log(`Plugin ${k} error in ${hookName}: ${e.message}`, "error");
-      }
-    }
-  };
-
-  // Smarter Intent Parser v2 (expanded verbs)
-  YG_LIB.VERB_INTENT_MAP = {
-    // Combat
-    "attack":"combat","hit":"combat","strike":"combat","stab":"combat","punch":"combat",
-    "slash":"combat","shoot":"combat","kick":"combat","lunge":"combat","fight":"combat",
-    "defend":"combat","invoke":"combat","cast":"combat","summon":"combat",
-    // Social (neutral talk)
-    "talk":"talk","speak":"talk","ask":"talk","chat":"talk","say":"talk","tell":"talk","question":"talk",
-    "explain":"talk","reply":"talk","discuss":"talk","argue":"talk","persuade":"talk","convince":"talk",
-    "answer":"talk","listen":"talk","whisper":"talk",
-    // Romance/erotic
-    "kiss":"flirt","caress":"flirt","touch":"flirt","embrace":"flirt","nuzzle":"flirt","seduce":"flirt",
-    "tease":"flirt","flirt":"flirt","grope":"flirt","stroke":"flirt","fondle":"flirt","lick":"flirt",
-    "moan":"flirt","cuddle":"flirt",
-    // Horror/fear
-    "scream":"fear","cry":"fear","tremble":"fear","shake":"fear","panic":"fear","faint":"fear",
-    "collapse":"fear","hide":"fear","fear":"fear","shiver":"fear","shriek":"fear",
-    "escape":"fear","run":"fear","sneak":"fear",
-    // Exploration
-    "look":"explore","examine":"explore","inspect":"explore","study":"explore","search":"explore",
-    "wander":"explore","observe":"explore","check":"explore","explore":"explore","climb":"explore",
-    "enter":"explore","light":"explore","jump":"explore",
-    // Use/interact
-    "open":"interact","close":"interact","take":"interact","grab":"interact","give":"interact",
-    "use":"interact","drop":"interact","hold":"interact","carry":"interact","place":"interact",
-    "repair":"interact","break":"interact","lock":"interact","unlock":"interact","throw":"interact",
-    "read":"interact","write":"interact","heal":"interact","trade":"interact","buy":"interact","sell":"interact"
-  };
-  // Context weights: biases based on game state flags
-  YG_LIB.CONTEXT_WEIGHTS = {
-    combatActive: { combat: +30, fear: +10 },
-    romanceActive: { flirt: +30, talk: +10 },
-    horrorActive: { fear: +30, combat: +10 },
-    location: {
-      tavern: { talk:+15, flirt:+10 },
-      bedroom: { flirt:+20, talk:+10 },
-      dungeon: { combat:+20, explore:+15, fear:+10 },
-      forest: { explore:+20, fear:+10 },
-      battlefield: { combat:+30, fear:+10 }
-    }
-  };
-  // Adverb intensifiers
-  YG_LIB.INTENSITY_MAP = {
-    "gently": -20,"softly": -15,"lightly": -10,"casually": -10,
-    "firmly": +10,"hard": +20,"forcefully": +40,"furiously": +40,"violently": +50,
-    "passionately": +30,"eagerly": +20,"slowly": -10,"quickly": +10
-  };
-
-  // === Helpers for intent parser ===
-  function tokenize(s){ return (s||"").toLowerCase().replace(/[^\w'\- ]+/g,' ').split(/\s+/).filter(Boolean); }
-  function extractDialogues(text){
-    const ds=[], re=/"([^"]+)"|'([^']+)'/g;
-    let m;
-    while((m=re.exec(text))!==null){ ds.push(m[1]||m[2]); }
-    return ds;
-  }
-  function splitClauses(text){
-    const raw = text.replace(/\s+/g,' ').trim();
-    return raw.split(/[\.\?\!;]+|\band\b/i).map(p=>p.trim()).filter(Boolean);
-  }
-  function findVerbs(words){
-    const verbs=[];
-    for(const w of words){
-      const lem = YG_LIB.lemmatize(w);
-      if(YG_LIB.VERB_INTENT_MAP[lem]) verbs.push(lem);
-      if(w.endsWith("ing") && YG_LIB.VERB_INTENT_MAP[w.slice(0,-3)]) verbs.push(w.slice(0,-3));
-      if(w.endsWith("ed") && YG_LIB.VERB_INTENT_MAP[w.slice(0,-2)]) verbs.push(w.slice(0,-2));
-    }
-    return [...new Set(verbs)];
-  }
-  function estimateIntensity(words, text){
-    let score=40;
-    for(const w of words){
-      if(YG_LIB.INTENSITY_MAP[w]) score+=YG_LIB.INTENSITY_MAP[w];
-    }
-    if(/[!]/.test(text)) score+=15;
-    score=Math.min(100,Math.max(0,score));
-    return score;
-  }
-
-  // Main intent parser function
-  YG_LIB.api.parseHeuristics = function(yg_state, rawText){
-    const text=(rawText||"").trim();
-    const dialogues=extractDialogues(text);
-    const clauses=splitClauses(text);
-    const clauseObjs=[];
-    const intentScores={};
-    for(const cl of clauses){
-      const words=tokenize(cl);
-      const verbs=findVerbs(words);
-      const intensity=estimateIntensity(words,cl);
-      verbs.forEach(v=>{
-        const intent=YG_LIB.VERB_INTENT_MAP[v]||"neutral";
-        intentScores[intent]=(intentScores[intent]||0)+(50+intensity/2);
-      });
-      clauseObjs.push({type:"action",text:cl,verbs,intensity});
-    }
-    // Add dialogues as separate entries
-    for(const d of dialogues){
-      clauseObjs.push({type:"speech",text:d,verbs:findVerbs(tokenize(d)),intensity:estimateIntensity(tokenize(d),d)});
-    }
-
-    // Apply context weights
-    if(yg_state){
-      if(yg_state.flags && yg_state.flags.storyFlags){
-        if(yg_state.flags.storyFlags.inCombat){
-          for(const k in YG_LIB.CONTEXT_WEIGHTS.combatActive)
-            intentScores[k]=(intentScores[k]||0)+YG_LIB.CONTEXT_WEIGHTS.combatActive[k];
-        }
-        // Extend for romanceActive and horrorActive if added to flags
-        if(yg_state.flags.storyFlags.romanceActive){
-          for(const k in YG_LIB.CONTEXT_WEIGHTS.romanceActive)
-            intentScores[k]=(intentScores[k]||0)+YG_LIB.CONTEXT_WEIGHTS.romanceActive[k];
-        }
-        if(yg_state.flags.storyFlags.horrorActive){
-          for(const k in YG_LIB.CONTEXT_WEIGHTS.horrorActive)
-            intentScores[k]=(intentScores[k]||0)+YG_LIB.CONTEXT_WEIGHTS.horrorActive[k];
-        }
-      }
-      if(yg_state.location && YG_LIB.CONTEXT_WEIGHTS.location[yg_state.location.toLowerCase()]){
-        const locBias=YG_LIB.CONTEXT_WEIGHTS.location[yg_state.location.toLowerCase()];
-        for(const k in locBias) intentScores[k]=(intentScores[k]||0)+locBias[k];
-      }
-    }
-
-    // Pick top intent
-    let intent="neutral",score=0;
-    for(const k in intentScores){
-      if(intentScores[k]>score){
-        score=intentScores[k];
-        intent=k;
-      }
-    }
-    return { raw:text, clauses:clauseObjs, dialogues, intent, score, intentScores };
-  };
-
-  // Semantic groups for pruning
-  YG_LIB.SEMANTIC_GROUPS = {
-    movement: ["go", "enter", "walk", "run", "leave", "arrive", "approach", "climb", "descend"],
-    perception: ["look", "see", "watch", "observe", "examine", "inspect", "search", "notice", "spot"],
-    dialogue: ["say", "ask", "tell", "reply", "answer", "whisper", "shout", "explain", "discuss"],
-    intimacy: ["touch", "kiss", "embrace", "hold", "caress", "stroke", "nuzzle", "cuddle"]
-    // Extend with more groups as relevant
-  };
-
-  // Proxy for semantic overlap counting keyword and group matches
-  YG_LIB.computeSemanticOverlap = function(textA, textB) {
-    if (!textA || !textB) return 0;
-    const wordsA = new Set(textA.toLowerCase().split(/\W+/).filter(Boolean).map(w => YG_LIB.lemmatize(w)));
-    const wordsB = new Set(textB.toLowerCase().split(/\W+/).filter(Boolean).map(w => YG_LIB.lemmatize(w)));
-    let score = 0;
-    // Direct word overlap adds 3 points each
-    for (const word of wordsA) {
-      if (wordsB.has(word)) score += 3;
-    }
-    // Semantic group overlap adds 1 point each
-    for (const [group, keywords] of Object.entries(YG_LIB.SEMANTIC_GROUPS)) {
-      const hasA = keywords.some(kw => wordsA.has(kw));
-      const hasB = keywords.some(kw => wordsB.has(kw));
-      if (hasA && hasB) score += 1;
-    }
-    return score;
-  };
-
-  // Prune semantically redundant memories, threshold default 5
-  YG_LIB.api.pruneSemanticRedundancies = function(threshold = 5) {
-    YG_LIB.api.ensureState();
-    const memories = Object.values(YG_STATE.memory || {});
-    const toDelete = new Set();
-
-    // Sort oldest first
-    memories.sort((a, b) => a.createdTurn - b.createdTurn);
-
-    for (let i = 0; i < memories.length; i++) {
-      if (toDelete.has(memories[i].id)) continue;
-      for (let j = i + 1; j < memories.length; j++) {
-        if (toDelete.has(memories[j].id)) continue;
-        const overlap = YG_LIB.computeSemanticOverlap(memories[i].text, memories[j].text);
-        if (overlap >= threshold) {
-          // Delete the less salient memory
-          const target = memories[i].salience < memories[j].salience ? memories[i] : memories[j];
-          toDelete.add(target.id);
-          break;
-        }
-      }
-    }
-
-    if (toDelete.size) {
-      for (const id of toDelete) {
-        delete YG_STATE.memory[id];
-        const idx = (YG_STATE._memoryIndex.byId || []).indexOf(id);
-        if (idx >= 0) YG_STATE._memoryIndex.byId.splice(idx, 1);
-        for (const k in YG_STATE._memoryIndex.byTag) {
-          YG_STATE._memoryIndex.byTag[k] = (YG_STATE._memoryIndex.byTag[k] || []).filter(i => i !== id);
-          if (!YG_STATE._memoryIndex.byTag[k].length) delete YG_STATE._memoryIndex.byTag[k];
-        }
-        for (const k in YG_STATE._memoryIndex.byEntity) {
-          YG_STATE._memoryIndex.byEntity[k] = (YG_STATE._memoryIndex.byEntity[k] || []).filter(i => i !== id);
-          if (!YG_STATE._memoryIndex.byEntity[k].length) delete YG_STATE._memoryIndex.byEntity[k];
-        }
-      }
-      YG_STATE.dirty.memory = true;
-      log(`Pruned ${toDelete.size} semantically redundant memories.`, "info");
-    }
-    return Array.from(toDelete);
-  };
-
-  // Narrative digest summary aggregation every turnWindow
-  YG_LIB.api.generateNarrativeDigest = function(turnWindow = 10) {
-    YG_LIB.api.ensureState();
-    const recentTurns = YG_STATE.turns - turnWindow;
-    const recentMemories = Object.values(YG_STATE.memory || {}).filter(m => m.createdTurn >= recentTurns && m.kind === 'outcome').sort((a, b) => a.createdTurn - b.createdTurn);
-    if (!recentMemories.length) return "Nothing of significance has happened recently.";
-
-    const topEvents = recentMemories.sort((a, b) => b.salience - a.salience).slice(0, 4);
-    const digestParts = [];
-    for (const event of topEvents) {
-      digestParts.push(`- ${event.zh || event.text}`);
-    }
-    const digestText = `Recent events (Turns ${recentTurns} to ${YG_STATE.turns}):\n` + digestParts.join('\n');
-
-    YG_LIB.addMemory({
-      text: digestText,
-      tier: "long",
-      tags: ["digest", `t${recentTurns}-${YG_STATE.turns}`],
-      kind: "summary",
-      source: "system",
-      salience: 50
-    });
-
-    // Archive previous turn summaries, start new buffer with digest
-    YG_STATE._archivedSummaries.push(...YG_STATE._turnSummaryBuffer);
-    YG_STATE._turnSummaryBuffer = [digestText];
-    YG_STATE.dirty._archivedSummaries = true;
-    YG_STATE.dirty._turnSummaryBuffer = true;
-
-    return digestText;
-  };
-
-  // Rule engine for state-based cadence behavior
-  YG_LIB.CADENCE_RULES = [
-    {
-      condition: (state) => (state.infamy || 0) > 15 && state.location && state.location.toLowerCase().includes("city"),
-      effect: (state) => {
-        state.narrativeSummary += `\nA bounty poster with your rough likeness appears on a notice board.`;
-        state.flags.storyFlags["wanted"] = true;
-        log("Cadence Rule: Infamy in a city -> Wanted flag set", "info");
-      },
-      weight: 10,
-      id: "infamy_city_wanted"
-    },
-    {
-      condition: (state) => (state.fame || 0) > 10 && state.entities && Object.values(state.entities).some(e => e.relations && e.relations.player === "lover"),
-      effect: (state) => {
-        const lover = Object.values(state.entities).find(e => e.relations && e.relations.player === "lover");
-        if (lover) {
-          state.narrativeSummary += `\nRumors of your relationship with ${lover.canonicalName} have begun to spread.`;
-          log(`Cadence Rule: Fame with a lover -> Rumors start about ${lover.canonicalName}`, "info");
-        }
-      },
-      weight: 5,
-      id: "fame_lover_rumors"
-    }
-    // Add more psychological, relationship, and event rules here
-  ];
-
-  YG_LIB.INTENT_RULES = [
-    {
-      condition: (state) => state.flags.storyFlags["inCombat"],
-      adjustments: { combat: +30, fear: +15, flirt: -50 }
-    },
-    {
-      condition: (state) => state.timeOfDay === "night" && state.location && state.location.toLowerCase().includes("bedroom"),
-      adjustments: { flirt: +20, talk: +10, explore: -20 }
-    }
-    // Extend with location, weather, companionship effects
-  ];
-
-  // Enhanced checkCadenceEvents to also run rules
-  YG_LIB.checkCadenceEventsEnhanced = function() {
-    YG_LIB.api.ensureState();
-    const t = YG_STATE.turns || 0;
-
-    // Run original time-based cadence
-    YG_LIB.checkCadenceEvents();
-
-    // Run rule-based cadence with weighted chances
-    for (const rule of YG_LIB.CADENCE_RULES) {
+    const compiledPatterns = {};
+    for (const [key, pattern] of Object.entries(patterns)) {
       try {
-        if (rule.condition(YG_STATE) && YG_LIB.randChance(rule.weight / 100)) {
-          rule.effect(YG_STATE);
-          YG_STATE.dirty.flags = true;
-          YG_STATE.dirty.narrativeSummary = true;
-        }
+        compiledPatterns[key] = pattern ? new RegExp(pattern, 'i') : null;
       } catch (e) {
-        log(`Error in cadence rule ${rule.id}: ${e.message}`, "error");
-      }
-    }
-  };
-
-  // Enhanced heuristic parser applying intent rules adjustments
-  YG_LIB.api.parseHeuristicsEnhanced = function(yg_state, rawText) {
-    const analysis = YG_LIB.api.parseHeuristics(yg_state, rawText);
-    analysis.intentScores = analysis.intentScores || {};
-
-    for (const rule of YG_LIB.INTENT_RULES) {
-      if (rule.condition(yg_state)) {
-        for (const [intent, adjustment] of Object.entries(rule.adjustments)) {
-          analysis.intentScores[intent] = (analysis.intentScores[intent] || 0) + adjustment;
-        }
+        compiledPatterns[key] = null;
+        if (cfg.debug) console.warn(`[YINGXUE] Invalid pattern for ${key}:`, e.message);
       }
     }
 
-    // Recalculate top intent
-    let topIntent = "neutral";
-    let topScore = 0;
-    for (const [intent, score] of Object.entries(analysis.intentScores)) {
-      if (score > topScore) {
-        topScore = score;
-        topIntent = intent;
+    const fillerWords = cfg.fillerWords || [];
+    const fillerRegex = fillerWords.length ? new RegExp(`\\b(${fillerWords.join('|')})\\b`, 'gi') : null;
+
+    globalThis.YINGXUE_CACHE = {
+      patterns: compiledPatterns,
+      fillerRegex,
+      // fixed passiveInputs (single-line, includes unicode ellipsis alternative)
+      passiveInputs: /^(continue|wait|do nothing|keep going|what happens|sit and wait|(?:\.\.\.|[\u2026]))\s*[.!?]*$/i,
+      locationTriggers: {
+        input: /(?:go to|enter|travel to|arrive at|head to|move to)\s+(?:the|a|an)?\s*([\w\s'’\-#]+?)(?=\s*[.,!?;"']|$)/i,
+        output: /(?:arrive at|enter|find yourself in|reach|standing in|now in|step into)\s+(?:a|the)?\s*([\w\s'’\-#]+?)(?=\s*[.,!?;"']|$)/i
       }
-    }
-    analysis.intent = topIntent;
-    analysis.score = topScore;
-    return analysis;
-  };
-
-  // PHASE1: New textPipeline to process input into attempts/dialogues
-  YG_LIB.textPipeline = function(raw) {
-    YG_LIB.api.ensureState();
-    let text = raw.trim();
-    let warnings = [];
-    let truncated = false;
-
-    // Normalize input: whitespace, add ending period if missing, fix pronoun expressions
-    text = text.replace(/\s+/g, " ");
-    if(!text.match(/^\/|^".+"$/) && !/[.!?]"?$/.test(text)) text += ".";
-    text = text.replace(/\bher (\w+) (\w+) quickly\b/i, "she quickly $2s her $1");
-    text = text.replace(/\bhis (\w+) (\w+) quickly\b/i, "he quickly $2s his $1");
-
-    // Extract dialogues
-    const dialogues = extractDialogues(text);
-
-    // Truncate to max input chars, preserving dialogues intact
-    if (text.length > YG_STATE.settings.maxInputChars) {
-      text = text.slice(0, YG_STATE.settings.maxInputChars) + "...";
-      truncated = true;
-      warnings.push("Input truncated to max chars.");
-    }
-
-    // Split clauses
-    const clauses = splitClauses(text);
-
-    // Detect intents using enhanced heuristic parser
-    const analysis = YG_LIB.api.parseHeuristicsEnhanced(YG_STATE, text);
-
-    // Build attempts: one per clause/dialogue
-    const attempts = [];
-    clauses.forEach((cl, idx) => {
-      const words = tokenize(cl);
-      const verbs = findVerbs(words);
-      const intent = verbs[0] ? YG_LIB.VERB_INTENT_MAP[verbs[0]] : "neutral";
-      const intensity = estimateIntensity(words, cl);
-      const emotion = detectAIEmotion(cl);
-      // Stub: confidence calculation can be expanded
-      const confidence = 80; // Placeholder constant confidence
-      attempts.push({ id: `A${idx+1}`, text: cl, intent, subIntent: verbs[1] || null, intensity, emotion, confidence });
-    });
-    dialogues.forEach((d, idx) => {
-      attempts.push({ id: `D${idx+1}`, text: d, intent: "talk", subIntent: "dialogue", intensity: 40, emotion: "neutral", confidence: 100 });
-    });
-
-    if(truncated) warnings.push(`Warning: input truncated to ${YG_STATE.settings.maxInputChars} chars.`);
-
-    return { text, attempts, dialogues, warnings, analysis };
-  };
-
-  // Expose core API bindings
-  YG_LIB.api.computeSalience = YG_LIB.computeSalience;
-  YG_LIB.api.addMemory = YG_LIB.addMemory;
-  YG_LIB.api.pruneMemories = YG_LIB.pruneMemories;
-  YG_LIB.api.getTopMemories = YG_LIB.getTopMemories;
-  YG_LIB.api.buildCompactContext = YG_LIB.buildCompactContext;
-  YG_LIB.api.detectVerbsTiny = YG_LIB.detectVerbsTiny;
-  YG_LIB.api.autoCanonicalizeText = YG_LIB.api.autoCanonicalizeText;
-  YG_LIB.api.queueTranslateToChinese = YG_LIB.api.queueTranslateToChinese;
-  YG_LIB.api.generateTranslationBatchPrompt = YG_LIB.api.generateTranslationBatchPrompt;
-  YG_LIB.api.checkCadenceEvents = YG_LIB.checkCadenceEvents;
-  YG_LIB.api.checkCadenceEventsEnhanced = YG_LIB.checkCadenceEventsEnhanced;
-  YG_LIB.api.parseHeuristics = YG_LIB.api.parseHeuristics;
-  YG_LIB.api.parseHeuristicsEnhanced = YG_LIB.api.parseHeuristicsEnhanced;
-
-})();
-
-// ===== Input Script: Yingxue Ultimate+ (Automated, Robust) =====
-// Handles normalization, commands, meta persistence, inventory add/parse.
-// Integrates with AI Dungeon's state/details/memory.
-
-YG_LIB && YG_LIB.api && YG_LIB.api.ensureState && YG_LIB.api.ensureState();
-
-// Safe base64 helpers (browser-safe)
-function safeB64Encode(str){
-  try{
-    return btoa(unescape(encodeURIComponent(String(str))));
-  } catch(e){ return ""; }
-}
-function safeB64Decode(b64){
-  try{
-    return decodeURIComponent(escape(atob(String(b64))));
-  } catch(e){ return ""; }
-}
-
-// Normalize input text
-function normalizeInput(text){
-  if(!text) return "";
-  let s = text.trim();
-  if(!s.match(/^\/|^".+"$/) && !/[.!?]"?$/.test(s)) s = s + ".";
-  s = s.replace(/\s+/g, " ");
-  s = s.replace(/\bher (\w+) (\w+) quickly\b/i, "she quickly $2s her $1");
-  s = s.replace(/\bhis (\w+) (\w+) quickly\b/i, "he quickly $2s his $1");
-  return s;
-}
-
-// Parse command from input
-function parseCommand(raw){
-  if(!raw) return null;
-  const t = raw.trim();
-  if(!t.startsWith("/")) return null;
-  const parts = t.slice(1).split(/\s+/);
-  return { cmd: parts[0].toLowerCase(), args: parts.slice(1), raw: t };
-}
-
-// Command handlers: memory, storycard, entity, settings, audit, status, inventory
-function handleMemoryCommand(cmd){
-  const sub = (cmd.args[0]||"").toLowerCase();
-  if(sub === "show"){
-    const mems = YG_LIB.api.getTopMemories({ top: 12 });
-    if(!mems.length) return { handled:true, reply: "No memories stored." };
-    const out = mems.map(m=>`#${m.id} [${m.tier}] ${YG_LIB.truncate(m.text,140)} (sal:${m.salience})`).join("\n");
-    return { handled:true, reply: `Top memories:\n${out}` };
-  }
-  if(sub === "add"){
-    const tier = (cmd.args[1]||"short").toLowerCase();
-    const text = cmd.args.slice(2).join(" ") || "manual note";
-    const e = YG_LIB.api.addMemory({ text, tier, tags:[], kind:"manual", source:"gm" });
-    return { handled:true, reply: `Added memory #${e.id} (tier=${e.tier})` };
-  }
-  if(sub === "translate"){
-    const id = parseInt(cmd.args[1],10);
-    if(!id || !YG_STATE.memory || !YG_STATE.memory[id]) return { handled:true, reply: "Usage: /memory translate <id> — memory not found." };
-    YG_LIB.api.queueTranslateToChinese(id);
-    const prompt = YG_LIB.api.generateTranslationBatchPrompt();
-    return { handled:true, reply: `Queued memory #${id} for translation.... Batch prompt:\n\n${YG_LIB.truncate(prompt||"(no queued)",2000)}` };
-  }
-  if(sub === "export"){
-    const exportObj = { memory: YG_STATE.memory, storyCard: YG_STATE.storyCard || {}, stateOverview: { turns: YG_STATE.turns, location: YG_STATE.location } };
-    return { handled:true, reply: `Export JSON:\n` + JSON.stringify(exportObj, null, 2).slice(0, 4000) };
-  }
-  if(sub === "backup"){
-    const payload = { state: YG_STATE, libConfig: YG_LIB.CONFIG };
-    const b64 = safeB64Encode(JSON.stringify(payload));
-    return { handled:true, reply: `BACKUP (base64):\n${b64}` };
-  }
-  if(sub === "import"){
-    const b64 = cmd.args.slice(1).join(" ");
-    if(!b64) return { handled:true, reply: "Usage: /memory import <base64>" };
-    try{
-      const raw = safeB64Decode(b64);
-      const parsed = JSON.parse(raw);
-      if(parsed && parsed.state) {
-        Object.assign(YG_STATE, parsed.state);
-        YG_STATE.dirty = YG_STATE.dirty || {};
-        return { handled:true, reply: "Imported state (best-effort)." };
-      }
-      return { handled:true, reply: "Invalid payload." };
-    }catch(e){
-      return { handled:true, reply: "Import failed: "+e.message };
-    }
-  }
-  return { handled:false, reply: "Usage: /memory [show|add|translate|export|backup|import]" };
-}
-
-function handleStoryCardCommand(cmd){
-  const sub = (cmd.args[0]||"").toLowerCase();
-  if(sub === "show"){
-    const sc = YG_STATE.storyCard || {};
-    return { handled:true, reply: `StoryCard (auto):\n${sc.entry || "(empty)"}\n\nTriggers: ${(sc.keys||[]).join(", ")}` };
-  }
-  if(sub === "sync"){
-    YG_STATE.dirty.storyCard = true;
-    return { handled:true, reply: "StoryCard will refresh automatically on next turn." };
-  }
-  return { handled:false, reply: "Usage: /storycard [show|sync]" };
-}
-
-function handleEntityCommand(cmd){
-  const sub = (cmd.args[0]||"").toLowerCase();
-  if(sub === "list"){
-    const list = YG_LIB.api.listEntities({ top: 50 }).map(e=> `${e.id} ${e.canonicalName || e.name || "(anon)"} (sal:${e.salience}, m:${e.mentions}) aliases:${(e.aliases||[]).slice(0,3).join(",")} rel:${Object.keys(e.relations||{}).length}`).join("\n");
-    return { handled:true, reply: list || "(no entities yet)" };
-  }
-  if(sub === "show"){
-    const id = cmd.args[1];
-    if(!id) return { handled:true, reply: "Usage: /entity show <id|name>" };
-    let ent = YG_LIB.api.getEntityByNameOrAlias(id) || YG_STATE.entities[id];
-    if(!ent) return { handled:true, reply: "Entity not found." };
-    return { handled:true, reply: JSON.stringify(ent, null, 2) };
-  }
-  if(sub === "alias"){
-    const id = cmd.args[1], alias = cmd.args.slice(2).join(" ");
-    if(!id || !alias) return { handled:true, reply: "Usage: /entity alias <id|name> <alias>" };
-    const res = YG_LIB.api.addAliasToEntity(id, alias);
-    return { handled:true, reply: res.ok ? `Added alias to ${res.id}: ${alias}` : `Error: ${res.msg}` };
-  }
-  if(sub === "merge"){
-    const a = cmd.args[1], b = cmd.args[2];
-    if(!a || !b) return { handled:true, reply: "Usage: /entity merge <primary> <secondary>" };
-    const res = YG_LIB.api.mergeEntities(a,b);
-    return { handled:true, reply: res.ok ? `Merged: primary=${res.primary} removed=${res.removed}` : `Error: ${res.msg}` };
-  }
-  if(sub === "relation"){
-    const a = cmd.args[1], b = cmd.args[2], type = cmd.args[3] || "ally";
-    if(!a || !b) return { handled:true, reply: "Usage: /entity relation <ent1> <ent2> [type]" };
-    const res = YG_LIB.api.addRelation(a, b, type);
-    return { handled:true, reply: res.ok ? `Added relation ${type} between ${a} and ${b}` : `Error: ${res.msg}` };
-  }
-  if(sub === "timeline"){
-    const id = cmd.args[1];
-    if(!id) return { handled:true, reply: "Usage: /entity timeline <id|name>" };
-    let ent = YG_LIB.api.getEntityByNameOrAlias(id) || YG_STATE.entities[id];
-    if(!ent) return { handled:true, reply: "Entity not found." };
-    const related = (YG_STATE._memoryIndex.byEntity && YG_STATE._memoryIndex.byEntity[ent.canonicalName]) || [];
-    const mems = related.map(i => YG_STATE.memory[i] ? `#${i} (T${YG_STATE.memory[i].createdTurn}): ${YG_LIB.truncate(YG_STATE.memory[i].text,90)}` : `#${i}`).join("\n");
-    return { handled:true, reply: `Timeline for ${ent.id} ${ent.canonicalName}:\nFirst seen: T${ent.firstSeenTurn}\nLast seen: T${ent.lastSeenTurn}\nMentions: ${ent.mentions}\nMemories:\n${mems}` };
-  }
-  if(sub === "export") return { handled:true, reply: YG_LIB.api.exportEntities() };
-  return { handled:true, reply: "Usage: /entity [list|show|alias|merge|relation|timeline|export]" };
-}
-
-function handleSettingsCommand(cmd){
-  const sub = (cmd.args[0]||"").toLowerCase();
-  if(sub === "show"){
-    return { handled:true, reply: JSON.stringify(YG_STATE.settings || {}, null, 2) };
-  }
-  if(sub === "set"){
-    const key = cmd.args[1];
-    const val = cmd.args.slice(2).join(" ");
-    if(!key) return { handled:true, reply: "Usage: /settings set <key> <value>" };
-    if(key === "entityStrictness"){
-      if(!["gentle","strict","ask"].includes(val)) return { handled:true, reply: "Valid values: gentle, strict, ask" };
-      YG_STATE.settings.entityStrictness = val;
-      YG_STATE.dirty.settings = true;
-      return { handled:true, reply: `entityStrictness set to ${val}` };
-    }
-    if(key === "translateAll"){
-      YG_STATE.settings.translateAll = (val === "on" || val === "true");
-      YG_STATE.dirty.settings = true;
-      return { handled:true, reply: `translateAll set to ${YG_STATE.settings.translateAll}` };
-    }
-    if(key === "translateAuto"){
-      YG_STATE.settings.translateAuto = (val === "on" || val === "true");
-      YG_STATE.dirty.settings = true;
-      return { handled:true, reply: `translateAuto set to ${YG_STATE.settings.translateAuto}. When queue has items, next non-command input will trigger translation mode.` };
-    }
-    return { handled:true, reply: "Unknown key. Valid: entityStrictness, translateAll, translateAuto" };
-  }
-  if(sub === "plugin"){
-    const name = cmd.args[1];
-    const action = cmd.args[2];
-    if(!name || !action) return { handled:true, reply: "Usage: /settings plugin <name> on|off" };
-    YG_LIB.plugins = YG_LIB.plugins || {};
-    if(!YG_LIB.plugins[name]) return { handled:true, reply: "Plugin not found." };
-    YG_LIB.plugins[name].enabled = (action === "on");
-    return { handled:true, reply: `Plugin ${name} ${(action==="on")?"enabled":"disabled"}` };
-  }
-  return { handled:true, reply: "Usage: /settings [show|set|plugin]" };
-}
-
-function handleAuditCommand(cmd){
-  YG_LIB.api.ensureState();
-  const memCount = Object.keys(YG_STATE.memory||{}).length;
-  const top = YG_LIB.api.getTopMemories({ top: 6 });
-  const topList = top.length ? top.map(m => `#${m.id} (${m.tier}) sal:${m.salience} "${YG_LIB.truncate(m.text,80)}"`).join("\n") : "(no top memories)";
-  const entCount = Object.keys(YG_STATE.entities||{}).length;
-  const activeFlags = Object.keys((YG_STATE.flags && YG_STATE.flags.storyFlags) || {}).filter(k => YG_STATE.flags.storyFlags[k]);
-  const storyCard = YG_STATE.storyCard && YG_STATE.storyCard.entry ? YG_STATE.storyCard.entry.slice(0,800) : "(none)";
-  const lastMem = YG_STATE._lastMemory ? `#${YG_STATE._lastMemory.id} @T${YG_STATE._lastMemory.createdTurn}: ${YG_STATE._lastMemory.text}` : "(no lastMemory)";
-  const out = [
-    `Turns: ${YG_STATE.turns || 0}`,
-    `Memories: ${memCount}`,
-    `Top:`,
-    topList,
-    `LastMemory: ${lastMem}`,
-    `Entities: ${entCount}`,
-    `ActiveFlags: ${activeFlags.join(", ") || "(none)"}`,
-    `StoryCard (snippet): ${YG_LIB.truncate(storyCard,400)}`,
-    `TranslateQueue: ${(YG_STATE._translateQueue||[]).length}`,
-    `Health: ${YG_STATE.playerHealth}/${YG_STATE.maxHealth}`,
-    `Inventory: ${YG_STATE.inventory.join(", ") || "empty"}`
-  ].join("\n\n");
-  return { handled:true, reply: out };
-}
-
-function handleStatusCommand(cmd){
-  const out = [
-    `Health: ${YG_STATE.playerHealth}/${YG_STATE.maxHealth}`,
-    `Inventory: ${YG_STATE.inventory.join(", ") || "empty"}`,
-    `Location: ${YG_STATE.location}`,
-    `Time: ${YG_STATE.timeOfDay}, Weather: ${YG_STATE.weather}`,
-    `Fame: ${YG_STATE.fame}, Infamy: ${YG_STATE.infamy}`,
-    `Goals: ${YG_STATE.currentGoals.join(", ") || "none"}`
-  ].join("\n");
-  return { handled:true, reply: out };
-}
-
-function handleInventoryCommand(cmd){
-  const sub = (cmd.args[0]||"").toLowerCase();
-  if(sub === "add"){
-    const item = cmd.args.slice(1).join(" ");
-    if(!item) return { handled:true, reply: "Usage: /inventory add <item>" };
-    if(YG_STATE.inventory.length >= YG_LIB.CONFIG.INVENTORY_MAX) return { handled:true, reply: "Inventory full." };
-    YG_STATE.inventory.push(item);
-    YG_STATE.dirty.inventory = true;
-    return { handled:true, reply: `Added ${item} to inventory.` };
-  }
-  if(sub === "remove"){
-    const item = cmd.args.slice(1).join(" ");
-    if(!item) return { handled:true, reply: "Usage: /inventory remove <item>" };
-    const idx = YG_STATE.inventory.indexOf(item);
-    if(idx < 0) return { handled:true, reply: "Item not found." };
-    YG_STATE.inventory.splice(idx, 1);
-    YG_STATE.dirty.inventory = true;
-    return { handled:true, reply: `Removed ${item} from inventory.` };
-  }
-  if(sub === "list"){
-    return { handled:true, reply: `Inventory: ${YG_STATE.inventory.join(", ") || "empty"}` };
-  }
-  return { handled:false, reply: "Usage: /inventory [add|remove|list]" };
-}
-
-// Modifier entry point for input handling
-const modifier = (text, state, info, history, memory) => {
-  // LOAD PERSISTENCE
-  if(state && typeof state === "object"){
-    YG_STATE = state.yg || {};
-  }
-  YG_LIB.api.ensureState();
-
-  // Use info.actionCount for turn count if provided
-  if(info && typeof info.actionCount === "number"){
-    YG_STATE.turns = info.actionCount;
-    YG_STATE.dirty.turns = true;
-  }
-
-  const normalized = normalizeInput(text);
-  const cmd = parseCommand(normalized);
-
-  if(cmd){
-    let res = null;
-    if(cmd.cmd === 'memory') res = handleMemoryCommand(cmd);
-    else if(cmd.cmd === 'storycard') res = handleStoryCardCommand(cmd);
-    else if(cmd.cmd === 'entity') res = handleEntityCommand(cmd);
-    else if(cmd.cmd === 'settings') res = handleSettingsCommand(cmd);
-    else if(cmd.cmd === 'audit') res = handleAuditCommand(cmd);
-    else if(cmd.cmd === 'status') res = handleStatusCommand(cmd);
-    else if(cmd.cmd === 'inventory') res = handleInventoryCommand(cmd);
-    if(res && res.handled){
-      state.message = res.reply;
-      return { text: '', stop: true };
-    }
-    state.message = `Unknown command: ${cmd.cmd}`;
-    return { text: '', stop: true };
-  } else {
-    // Normal input processing
-    YG_STATE.lastAction = normalized;
-    YG_STATE.dirty.lastAction = true;
-
-    // Run heuristic parser on normalized input
-    const analysis = YG_LIB.api.parseHeuristicsEnhanced(YG_STATE, normalized);
-    YG_STATE._lastInputAnalysis = analysis;
-    YG_STATE.dirty._lastInputAnalysis = true;
-
-    // Detect verbs
-    const verbs = YG_LIB.detectVerbsTiny(normalized);
-
-    // Auto canonicalize entities
-    const entities = YG_LIB.api.autoCanonicalizeText(normalized);
-
-    // Add player action memory
-    YG_LIB.addMemory({
-      text: `Player Action: ${YG_LIB.truncate(normalized, 300)}`,
-      tier: "short",
-      tags:["action"],
-      kind:"action",
-      source:"player"
-    });
-
-    // Set flags from keywords
-    const flagScores = YG_LIB.scoreKeywordGroups(normalized, YG_LIB.KEYMAP.flags);
-    for(const [flag, score] of Object.entries(flagScores)){
-      if(score > 0){
-        YG_STATE.flags.storyFlags[flag] = true;
-        YG_STATE.dirty.flags = true;
-      }
-    }
-
-    // Add goals from keywords
-    const goalScores = YG_LIB.scoreKeywordGroups(normalized, YG_LIB.KEYMAP.goals);
-    for(const [goal, score] of Object.entries(goalScores)){
-      if(score > 0 && !YG_STATE.currentGoals.includes(goal)){
-        YG_STATE.currentGoals.push(goal);
-        YG_STATE.dirty.currentGoals = true;
-      }
-    }
-
-    // Inventory simple parsing: "take X"
-    const takeMatch = normalized.match(/take\s+(.+?)(?:\.|$)/i);
-    if(takeMatch && YG_STATE.inventory.length < YG_LIB.CONFIG.INVENTORY_MAX){
-      const item = takeMatch[1].trim();
-      if(!YG_STATE.inventory.includes(item)){
-        YG_STATE.inventory.push(item);
-        YG_STATE.dirty.inventory = true;
-        YG_LIB.addMemory({ text: `Acquired item: ${item}`, tier: "short", tags:["inventory"] });
-      }
-    }
-    // Inventory simple parsing: "drop X"
-    const dropMatch = normalized.match(/drop\s+(.+?)(?:\.|$)/i);
-    if(dropMatch){
-      const item = dropMatch[1].trim();
-      const idx = YG_STATE.inventory.indexOf(item);
-      if(idx >= 0){
-        YG_STATE.inventory.splice(idx, 1);
-        YG_STATE.dirty.inventory = true;
-        YG_LIB.addMemory({ text: `Dropped item: ${item}`, tier: "short", tags:["inventory"] });
-      }
-    }
-
-    // Input meta
-    YG_STATE._lastInputMeta = {
-      inputType: "normal",
-      verbs,
-      emotion: detectAIEmotion(normalized) // reuse AI emotion detector for player input
     };
-    YG_STATE.dirty._lastInputMeta = true;
-  }
 
-  // Run input plugins/hooks
-  try{
-    YG_LIB.runHook("input", normalized);
-  } catch(e){
-    log(`Input hook error: ${e.message}`, "error");
-  }
+    state.yingxue._cacheVersion = (state.yingxue._cacheVersion || 0) + 1;
+    if (cfg.logToConsole) console.log('[YINGXUE] Cache rebuilt, version:', state.yingxue._cacheVersion);
+    return true;
 
-  // SAVE PERSISTENCE
-  if(state && typeof state === "object"){
-    state.yg = YG_STATE;
-  }
-
-  return { text: normalized };
+  } catch (e) { 
+    console.error('[YINGXUE] Cache rebuild failed:', e); 
+    return false; 
+  } 
 };
 
-// ===== Context Script: Yingxue Ultimate+ Context (Automated, Robust) =====
-// Builds compact context, processes input meta, updates storycard, prunes memories/summaries,
-// handles auto-translate mode. Integrates state/details/memory.
+// ---------------- Subtext Detection ---------------- 
+const YX_SUBTEXT = { 
+  detectSubtext: function(text) { 
+    if (!text || typeof text !== 'string') return { detected: false, types: [], confidence: 0 }; 
+    const subtextTypes = []; 
+    const lower = text.toLowerCase();
 
-YG_LIB && YG_LIB.api && YG_LIB.api.ensureState && YG_LIB.api.ensureState();
+    const boundaryTests = [
+      /\b(just|only|simply)\s+(a|one|quick|small|little|brief)\b/i,
+      /\b(maybe|perhaps|possibly)\s+(we|you|i)\s+(could|should|might)\b/i,
+      /\b(what\s+if|suppose|imagine\s+if)\b/i
+    ];
+    const indirectRequests = [
+      /\b(i\s+wish|if\s+only|it\s+would\s+be\s+nice)\b/i,
+      /\b(some\s+people|someone|anyone)\s+(would|might|could)\b/i,
+      /\b(i\s+wonder|curious\s+about|makes\s+me\s+think)\b/i
+    ];
+    const seekingReassurance = [
+      /\b(probably\s+(boring|stupid|weird|wrong)|not\s+(interesting|important|worth))\b/i,
+      /\b(you\s+(must\s+think|probably|surely))\b/i,
+      /\b(sorry\s+(for|if|that)|hope\s+i'm\s+not)\b/i
+    ];
+    const plausibleDeniability = [
+      /\b(just\s+(friends|being\s+friendly|helping|curious))\b/i,
+      /\b(purely\s+(platonic|innocent|professional))\b/i,
+      /\b(for\s+(research|science|curiosity))\b/i
+    ];
+    const vulnerabilityTests = [
+      /\b(trust\s+me|between\s+(us|you\s+and\s+me)|our\s+secret)\b/i,
+      /\b(never\s+told\s+anyone|don't\s+usually)\b/i,
+      /\b(can\s+i\s+(tell|ask|trust)\s+you)\b/i
+    ];
+    const jealousyProbes = [
+      /\b(other\s+(people|guys|girls)|someone\s+else)\b/i,
+      /\b(popular|attractive|charming)\s+(with|to)\b/i,
+      /\b(i\s+bet|probably|must\s+have)\s+.*(lots\s+of|many|other)/i
+    ];
 
-const modifier = (text, state, info, history, memory) => {
-  // LOAD PERSISTENCE
-  if(state && typeof state === "object"){
-    YG_STATE = state.yg || {};
+    if (boundaryTests.some(r => r.test(text))) subtextTypes.push('boundary_testing');
+    if (indirectRequests.some(r => r.test(text))) subtextTypes.push('indirect_request');
+    if (seekingReassurance.some(r => r.test(text))) subtextTypes.push('seeking_reassurance');
+    if (plausibleDeniability.some(r => r.test(text))) subtextTypes.push('plausible_deniability');
+    if (vulnerabilityTests.some(r => r.test(text))) subtextTypes.push('vulnerability_test');
+    if (jealousyProbes.some(r => r.test(text))) subtextTypes.push('jealousy_probe');
+
+    // contradictions
+    const contradictionPatterns = [
+      /\b(not\s+that\s+i|don't\s+get\s+me\s+wrong|not\s+to\s+be)\b.*\bbut\b/i,
+      /\b(just|only|simply)\b.*\b(but|however|though)\b/i
+    ];
+    if (contradictionPatterns.some(r => r.test(text))) subtextTypes.push('contradiction');
+
+    // emotional inflation
+    const strongEmotions = /\b(amazing|incredible|perfect|wonderful|terrible|awful|devastating|overwhelming)\b/i;
+    const minorActions = /\b(look|glance|touch|sit|stand|walk|smile|nod|shrug)\b/i;
+    if (strongEmotions.test(text) && minorActions.test(text)) subtextTypes.push('emotional_inflation');
+
+    return {
+      detected: subtextTypes.length > 0,
+      types: subtextTypes,
+      confidence: Math.min(1, subtextTypes.length * 0.28)
+    };
+
+  },
+
+  generateSubtextGuidance: function(subtextData) { 
+    if (!subtextData || !subtextData.detected) return null; 
+    const map = { 
+      'boundary_testing': "Character should respond to the underlying test, not just the surface request.", 
+      'indirect_request': "Character may pick up on the hint or miss it entirely based on their personality and relationship level.", 
+      'seeking_reassurance': "Character can offer genuine reassurance, a gentle reality check, or miss the emotional need.", 
+      'plausible_deniability': "Character may see through the excuse or take it at face value.", 
+      'vulnerability_test': "Response reveals emotional availability and boundaries.", 
+      'jealousy_probe': "Character may address jealousy, be oblivious, or find it endearing/annoying.", 
+      'contradiction': "Character might notice contradiction and call it out, or focus on the true underlying feeling.", 
+      'emotional_inflation': "Character may respond to the stated emotion level or the actual situation based on their emotional intelligence." 
+    }; 
+    const primary = subtextData.types[0]; 
+    let text = map[primary] || 'Subtext detected - respond to both surface and underlying meanings.'; 
+    if (subtextData.types.length > 1) text += ' Multiple layers present - show layered response.'; 
+    return text; 
+  } 
+};
+
+// ---------------- Helpers & Small Utilities ---------------- 
+const YX_HELPERS = { 
+  log: function(...args) { 
+    if (state.yingxue?.config?.logToConsole) console.log('[YINGXUE]', ...args); 
+  },
+
+  // Improved name extractor: quoted names, "named/called", or robust TitleCase checks (ignores common sentence starters) 
+  extractCharacterName: function(text) { 
+    if (!text || typeof text !== 'string') return null; 
+    // 1) quoted... (unchanged)
+    const q = text.match(/"([A-Z][a-z]{1,}\b(?:\s[A-Z][a-z]{1,}\b)?)"/); 
+    if (q) return q[1];
+
+    // 2) named/called... (unchanged)
+    const named = text.match(/\b(?:named|called)\s+([A-Z][a-z]{1,}(?:\s[A-Z][a-z]{1,})?)/);
+    if (named) return named[1];
+
+    // 3) TitleCase: min 4 letters, skip generics/sentence-starts
+    const generics = new Set(['This','That','Here','There','It','One','All','Some','Many','Few']);
+    const stop = new Set(['The','A','An','And','But','Or','For','Nor','So','Yet','Then','When','While','If','Because','Is','Are','It','You','He','She','They','We']);
+    stop.add(...generics); // Merge generics into stop
+    const titleMatches = [...text.matchAll(/\b([A-Z][a-z]{3,})(?:\s([A-Z][a-z]{3,}))?\b/g)]; // Min 4 letters
+    for (const m of titleMatches) {
+      const candidate = (m[2] ? `${m[1]} ${m[2]}` : m[1]);
+      const firstWord = m[1];
+      if (candidate.length > 3 && !stop.has(firstWord) && !/^[.!?]\s+/.test(text.slice(0, text.indexOf(firstWord)))) { // Skip if likely sentence-start
+        return candidate;
+      }
+    }
+    return null;
+  },
+
+  // Multi-match action detector: returns array|string|null 
+  detectActionType: function(text) { 
+    if (!text || !globalThis.YINGXUE_CACHE) return null; 
+    const cache = globalThis.YINGXUE_CACHE; 
+    // Priority order (higher first) 
+    const order = ['risky', 'assertive', 'social', 'emotional', 'intimate']; 
+    const found = []; 
+    for (const k of order) { 
+      const r = cache.patterns[k]; 
+      if (r && r.test(text)) found.push(k); 
+    } 
+    if (found.length === 0) return null; 
+    if (found.length === 1) return found[0]; 
+    return found; // array of matches in priority order 
+  },
+
+  // NEW: Infer input mode heuristically (meta preferred when available) 
+  inferInputMode: function(text, meta) { 
+    if (meta && meta.inputMode) return meta.inputMode; 
+    if (globalThis.AIDungeon && globalThis.AIDungeon.inputMode) return globalThis.AIDungeon.inputMode; 
+    if (!text || typeof text !== 'string') return 'do'; 
+    const trimmed = text.trim(); 
+    if (trimmed.startsWith('You say, "') || (trimmed.startsWith('"') && trimmed.endsWith('"'))) return 'say'; 
+    if (trimmed.length > 120 && !/\b(I|you)\s+(do|say|go|take)\b/i.test(trimmed)) return 'story'; 
+    if (/\b(a|an|the)\s+(beautiful|fiery|dark|ancient|mysterious|old)\s+(dragon|castle|elf|scene|forest|landscape)\b/i.test(trimmed)) return 'see'; 
+    return 'do'; 
+  },
+
+  assessInputDepth: function(text) { 
+    if (!text) return 'empty'; 
+    const trimmed = text.trim(); 
+    if (trimmed.length < 5) return 'minimal'; 
+    const cache = globalThis.YINGXUE_CACHE; 
+    if (cache?.passiveInputs?.test(trimmed)) return 'passive'; 
+    const hasInternalThought = /\b(thinks|feels|wonders|realizes|notices|hopes)\b/i.test(text); 
+    const hasEmotionalWords = /\b(nervous|excited|worried|hopeful|curious|hesitant|vulnerable|attracted|conflicted)\b/i.test(text); 
+    const hasDetailedAction = text.length > 60 && /\b(gently|carefully|slowly|softly|deliberately|hesitantly|nervously|tenderly)\b/i.test(text); 
+    const hasDialogue = (text.match(/"/g) || []).length >= 2; 
+    const hasSub = YX_SUBTEXT.detectSubtext(text);
+
+    let depth = 'basic';
+    if (hasInternalThought || hasEmotionalWords) depth = 'thoughtful';
+    if (hasDetailedAction && (hasInternalThought || hasEmotionalWords)) depth = 'rich';
+    if (hasDialogue && hasInternalThought && text.length > 80) depth = 'immersive';
+    if (hasSub.detected) depth = depth === 'immersive' ? 'masterful' : 'nuanced';
+    return depth;
+
+  },
+
+  cleanFillers: function(text) { 
+    if (!text || typeof text !== 'string') return text; 
+    try { 
+      const c = globalThis.YINGXUE_CACHE; 
+      if (c?.fillerRegex) return text.replace(c.fillerRegex, '').replace(/\s{2,}/g, ' ').trim(); 
+    } catch (e) { 
+      YX_HELPERS.log('Filler cleaning failed:', e.message); 
+    } 
+    return text.replace(/\s{2,}/g, ' ').trim(); 
+  },
+
+  extractLocation: function(text, type = 'input') { 
+    if (!text || !globalThis.YINGXUE_CACHE) return null; 
+    try { 
+      const regex = globalThis.YINGXUE_CACHE.locationTriggers[type]; 
+      const match = regex?.exec(text); 
+      return match?.[1]?.trim() || null; 
+    } catch (e) { 
+      return null; 
+    } 
+  },
+
+  normalizePronouns: function(text) { 
+    if (!text || typeof text !== 'string') return text; 
+    const cfg = state.yingxue?.config || { perspective: 'second' }; 
+    const direction = cfg.perspective; 
+    try { 
+      // Extract and protect quoted sections 
+      const quoteMatches = text.match(/"([^"]*)"/g) || []; 
+      let protectedText = text; 
+      const placeholders = []; 
+      quoteMatches.forEach((match, idx) => { 
+        const placeholder = `__QUOTE_${idx}__`; 
+        placeholders[idx] = match; 
+        protectedText = protectedText.replace(match, placeholder); 
+      });
+
+      // Safer pronoun normalization: prefer lookbehind when available, otherwise anchored replace
+      if (direction === 'first') {
+        // 2nd → 1st: You → I, your → my, etc.
+        protectedText = protectedText
+          .replace(/\bYou are\b/gi, 'I am').replace(/\bYou're\b/gi, "I'm")
+          .replace(/\bYou were\b/gi, 'I was').replace(/\bYou have\b/gi, 'I have').replace(/\bYou've\b/gi, "I've")
+          .replace(/\bYou will\b/gi, 'I will').replace(/\bYou'll\b/gi, "I'll")
+          .replace(/\b(to|for|with|at|from)\s+you\b/gi, '$1 me')
+          .replace(/\bYour\s+/gi, 'My ');
+        // Sentence-initial You -> I (fallback safe anchor)
+        protectedText = protectedText.replace(/(^|[.!?]\s+)(You)\b/gi, (m, p1) => p1 + 'I');
+      } else {
+        // 'second' - 1st → 2nd
+        protectedText = protectedText
+          .replace(/\bI am\b/gi, 'you are').replace(/\bI'm\b/gi, "you're")
+          .replace(/\bI was\b/gi, 'you were')
+          .replace(/\bI have\b/gi, 'you have').replace(/\bI've\b/gi, "you've")
+          .replace(/\bI will\b/gi, 'you will').replace(/\bI'll\b/gi, "you'll")
+          .replace(/\b(to|for|with|at|from)\s+me\b/gi, '$1 you')
+          .replace(/\bMy\s+/gi, 'your ');
+        // Sentence-start I -> You with safer anchor
+        protectedText = protectedText.replace(/(^|[.!?]\s+)(I)\b/gi, (m, p1) => p1 + 'You');
+      }
+
+      // Restore quotes
+      placeholders.forEach((match, idx) => {
+        protectedText = protectedText.replace(`__QUOTE_${idx}__`, match);
+      });
+      return protectedText;
+    } catch (e) {
+      YX_HELPERS.log('Pronoun normalization failed:', e.message);
+      return text;
+    }
+  },
+
+  analyzeCharacterResponse: function(text) { 
+    if (!text) return 'neutral_interaction'; 
+    if (/(pulls?\s+away|steps?\s+back|rejects?|refuses?|says?\s+no|shakes?\s+head)/i.test(text)) return (state.yingxue.lastActionType || 'action') + '_rejected'; 
+    if (/(accepts?|agrees?|nods|smiles|leans?\s+in|moves?\s+closer|says?\s+yes)/i.test(text)) return (state.yingxue.lastActionType || 'action') + '_accepted'; 
+    if (/(angry|upset|annoyed|frustrated|glares?|frowns?)/i.test(text)) return 'conflict'; 
+    if (/(laughs?|giggles?|grins?|playful|teasing)/i.test(text)) return 'social_positive'; 
+    if (/(blushes?|nervous|shy|hesitant|uncertain)/i.test(text)) return 'emotional_shared'; 
+    return 'neutral_interaction'; 
+  },
+
+  syncState: function() {
+    // Quick sync: Propagate latest from input/output to global
+    const yx = state.yingxue;
+    if (yx.lastInputDepth && !yx.lastActionType) yx.lastActionType = 'character_action'; // Fallback
+    if (yx.currentLocation === 'null' || !yx.currentLocation) yx.currentLocation = 'an unknown place';
+    if (yx.engagement < 0) yx.engagement = 0; // Clamp low
+    yx.flags.lastInputMode = yx.flags.lastInputMode || 'do';
+    YX_HELPERS.log('State synced: turn=' + yx.turn + ', loc=' + yx.currentLocation + ', eng=' + yx.engagement);
   }
-  YG_LIB.api.ensureState();
+};
 
-  // Use info.actionCount for turn count if provided
-  if(info && typeof info.actionCount === "number"){
-    YG_STATE.turns = info.actionCount;
-    YG_STATE.dirty.turns = true;
+// ---------------- Character Memory & Relationship (Patched Compact) ---------------- 
+const YX_CHARACTERS = { 
+  updateCharacterMemory: function(name, interaction, mood = null) { 
+    if (!name || !interaction) return; 
+    const cfg = state.yingxue.config; 
+    state.yingxue.characters = state.yingxue.characters || {}; 
+    const char = state.yingxue.characters[name] || { 
+      name, rel: 0,            // relationship (-5..5) 
+      int: 0,            // intimacy (0..5) 
+      last: 0,           // last seen turn 
+      mood: 'neutral', 
+      traits: [], 
+      history: [] 
+    };
+
+    // History: store compact entry (t=turn, type truncated)
+    char.history.push({ t: state.yingxue.turn, type: (interaction || '').substring(0, 12) });
+    const maxHist = cfg.compactMode ? 3 : 10;
+    if (char.history.length > maxHist) char.history = char.history.slice(-maxHist);
+
+    char.last = state.yingxue.turn;
+    char.mood = mood || state.yingxue.currentMood;
+
+    // Auto-trait from subtext (small bonus)
+    if (state.yingxue.lastSubtext?.detected) {
+      const traitRaw = state.yingxue.lastSubtext.types[0];
+      const trait = traitRaw ? traitRaw.replace(/_/g, '') : null;
+      if (trait && !char.traits.includes(trait)) {
+        char.traits.push(trait);
+        if (char.traits.length > 5) char.traits.shift();
+      }
+    }
+
+    // Adjust relationship using compact fields
+    this.adjustRelationship(char, interaction);
+
+    // Keep a tiny establishedMoods array (prune)
+    char.establishedMoods = char.establishedMoods || [];
+    if (char.establishedMoods.length === 0 || char.establishedMoods[char.establishedMoods.length - 1] !== char.mood) {
+      char.establishedMoods.push(char.mood);
+      if (char.establishedMoods.length > 5) char.establishedMoods = char.establishedMoods.slice(-5);
+    }
+
+    state.yingxue.characters[name] = char;
+    YX_HELPERS.log(`Memory update: ${name} (rel:${char.rel}, int:${char.int}, traits:${char.traits.join(',')})`);
+
+  },
+
+  adjustRelationship: function(char, interaction) { 
+    if (!char) return; 
+    // map compact interactions to adjustments 
+    const adjustments = { 
+      'intimate_accepted': { rel: +2, int: +1 }, 
+      'intimate_rejected': { rel: -1, int: 0 }, 
+      'emotional_shared': { rel: +1, int: +0.5 }, 
+      'social_positive': { rel: +1, int: 0 }, 
+      'social_negative': { rel: -1, int: 0 }, 
+      'assertive_accepted': { rel: 0, int: 0 }, 
+      'assertive_rejected': { rel: -2, int: -0.5 }, 
+      'conflict': { rel: -1, int: -0.5 } 
+    }; 
+    const adj = adjustments[interaction] || null; 
+    if (adj) { 
+      char.rel = Math.max(-5, Math.min(5, (char.rel || 0) + (adj.rel || 0))); 
+      char.int = Math.max(0, Math.min(5, (char.int || 0) + (adj.int || 0))); 
+    } 
+  },
+
+  getPrimaryCharacter: function() { 
+    if (!state.yingxue.characters) return null; 
+    const chars = Object.values(state.yingxue.characters); 
+    if (chars.length === 0) return null; 
+    return chars.sort((a, b) => (b.last || 0) - (a.last || 0))[0]; 
+  },
+
+  getRelationshipContext: function(name) { 
+    const char = state.yingxue.characters?.[name]; 
+    if (!char) return null; 
+    const relMap = { 
+      '-5': 'hostile', '-4': 'antagonistic', '-3': 'unfriendly', '-2': 'cool', '-1': 'distant', 
+      '0': 'neutral', '1': 'friendly', '2': 'warm', '3': 'close', '4': 'intimate', '5': 'deeply connected' 
+    }; 
+    const intLabels = { 
+      '0': 'strangers', '1': 'acquaintances', '2': 'friends', '3': 'close friends', '4': 'intimate', '5': 'deeply intimate' 
+    }; 
+    return { 
+      relationship: relMap[(char.rel || 0).toString()] || 'neutral', 
+      intimacy: intLabels[Math.floor(char.int || 0).toString()] || 'strangers', 
+      recentMoods: (char.establishedMoods || []).slice(-3), 
+      turnsSinceLastSeen: state.yingxue.turn - (char.last || 0) 
+    }; 
+  } 
+};
+
+// ---------------- Tension & Mood ---------------- 
+const YX_TENSION = { 
+  updateTension: function(actionTypeInput, inputDepth, subtextData) { 
+    const cfg = state.yingxue.config.tension; 
+    let tensionDelta = 0; 
+    const tensionMap = { 
+      'intimate': +2, 'emotional': +1.5, 'social': +1, 'assertive': +1, 'risky': +3 
+    };
+
+    // accept array or single type
+    const types = Array.isArray(actionTypeInput) ? actionTypeInput : (actionTypeInput ? [actionTypeInput] : []);
+    let base = 0;
+    for (const t of types) base += (tensionMap[t] || 0);
+    tensionDelta = base * cfg.buildRate;
+
+    const depthMultiplier = { 'minimal': 0.5, 'basic': 1, 'thoughtful': 1.2, 'rich': 1.5, 'immersive': 2, 'masterful': 2.5, 'nuanced': 1.8 };
+    tensionDelta *= (depthMultiplier[inputDepth] || 1);
+
+    if (subtextData && subtextData.detected) tensionDelta += subtextData.confidence * 2;
+
+    // decay only on certain turns if configured
+    let decay = cfg.decayRate || 0;
+    if (typeof cfg.decayEveryN === 'number' && cfg.decayEveryN > 0) {
+      decay = (state.yingxue.turn % cfg.decayEveryN === 0) ? cfg.decayRate : 0;
+    }
+
+    state.yingxue.relationshipTension = Math.max(cfg.minTension, Math.min(cfg.maxTension, state.yingxue.relationshipTension - decay + tensionDelta));
+    state.yingxue.currentScene.emotionalTension = Math.round(state.yingxue.relationshipTension / 3);
+
+  },
+
+  getMoodContagion: function(characterMood, playerAction) { 
+    const map = { 
+      'happy': { 'intimate': 'excited', 'emotional': 'warm', 'social': 'pleased' }, 
+      'sad': { 'intimate': 'vulnerable', 'emotional': 'melancholy', 'social': 'withdrawn' }, 
+      'angry': { 'intimate': 'conflicted', 'emotional': 'intense', 'social': 'sharp' }, 
+      'nervous': { 'intimate': 'flustered', 'emotional': 'anxious', 'social': 'cautious' }, 
+      'playful': { 'intimate': 'teasing', 'emotional': 'light', 'social': 'engaging' } 
+    }; 
+    return map[characterMood]?.[playerAction] || characterMood; 
+  } 
+};
+
+// ---------------- Emotional Momentum ---------------- 
+const YX_MOMENTUM = { 
+  update: function(actionType, responseType) { 
+    const momentum = state.yingxue.emotionalMomentum || { type: null, strength: 0, decay: 0.6 }; 
+    const cfg = state.yingxue.config; 
+    if (!cfg.emotionalMomentum) return; // Gated
+
+    const momentumMap = {
+      'intimate_accepted': { type: 'romantic_buildup', strength: 2 },
+      'intimate_rejected': { type: 'romantic_tension', strength: 1.5 },
+      'conflict': { type: 'dramatic_tension', strength: 2 },
+      'emotional_shared': { type: 'emotional_bonding', strength: 1.5 },
+      'jealousy_probe_accepted': { type: 'obsessive_spiral', strength: 2.5 }
+    };
+
+    const key = responseType || (actionType ? `${actionType}_neutral` : null);
+    const newMomentum = momentumMap[responseType] || momentumMap[key];
+
+    if (newMomentum) {
+      if (momentum.type === newMomentum.type) {
+        momentum.strength = Math.min(5, (momentum.strength || 0) + newMomentum.strength * 0.7);
+      } else {
+        momentum.type = newMomentum.type;
+        momentum.strength = newMomentum.strength;
+      }
+    } else {
+      momentum.strength = Math.max(0, (momentum.strength || 0) - (momentum.decay || 0.6));
+      if (momentum.strength < 0.5) {
+        momentum.type = null;
+        momentum.strength = 0;
+      }
+    }
+    state.yingxue.emotionalMomentum = momentum;
+    YX_HELPERS.log(`Momentum: ${momentum.type} (${(momentum.strength||0).toFixed(1)})`);
+
+  } 
+};
+
+// ---------------- Time ---------------- 
+const YX_TIME = { 
+  advance: function(steps = 1) { 
+    try { 
+      const cfg = state.yingxue.config.timeCycle; 
+      state.yingxue.timeIndex = Math.max(0, (state.yingxue.timeIndex || 0) + steps); 
+      const totalPhases = cfg.phases.length; 
+      const totalTicks = totalPhases * cfg.ticksPerPhase; 
+      const tick = state.yingxue.timeIndex % totalTicks; 
+      const phaseIndex = Math.floor(tick / cfg.ticksPerPhase); 
+      const newPhase = cfg.phases[phaseIndex] || 'Unknown'; 
+      const moods = { 
+        'Dawn': 'hopeful', 'Morning': 'energetic', 'Noon': 'active', 'Afternoon': 'focused', 'Evening': 'calm', 'Night': 'mysterious' 
+      }; 
+      if (moods[newPhase] && !state.yingxue.playerStatus.includes('injured')) state.yingxue.currentMood = moods[newPhase]; 
+      YX_HELPERS.log('Time advanced to', newPhase); 
+    } catch (e) { 
+      YX_HELPERS.log('Time advance failed:', e.message); 
+    } 
+  },
+
+  getCurrentPhase: function() { 
+    try { 
+      const cfg = state.yingxue.config.timeCycle; 
+      const totalPhases = cfg.phases.length; 
+      const totalTicks = totalPhases * cfg.ticksPerPhase; 
+      const day = Math.floor(state.yingxue.timeIndex / totalTicks) + 1; 
+      const tickInDay = state.yingxue.timeIndex % totalTicks; 
+      const phaseIndex = Math.floor(tickInDay / cfg.ticksPerPhase); 
+      const phase = cfg.phases[phaseIndex] || 'Unknown'; 
+      return { day, phase, tick: (tickInDay % cfg.ticksPerPhase) + 1 }; 
+    } catch (e) { 
+      return { day: 1, phase: 'Unknown', tick: 1 }; 
+    } 
+  } 
+};
+
+// ---------------- Author Notes (Enhanced) ---------------- 
+const YX_AUTHOR_NOTES = { 
+  send: function(note, force = false) { 
+    try { 
+      const cfg = state.yingxue.config.authorNotes; 
+      if (!cfg.enabled && !force) return false; 
+      if (!note || typeof note !== 'string') return false; 
+      const cleanNote = note.slice(0, cfg.maxLength).trim(); 
+      if (!cleanNote) return false; 
+      state.memory = state.memory || {}; 
+      state.memory.authorsNote = cleanNote; 
+      state.yingxue.flags.authorNoteSent = true; 
+      state.yingxue.flags._lastAuthorNoteTurn = state.yingxue.turn;
+      state.yingxue.metrics.authorNotesSent++; 
+      YX_HELPERS.log('Author note:', cleanNote); 
+      return true; 
+    } catch (e) { 
+      YX_HELPERS.log('Author note failed:', e.message); 
+      return false; 
+    } 
+  },
+
+  clear: function() { 
+    try { 
+      if (state.memory?.authorsNote) delete state.memory.authorsNote; 
+      state.yingxue.flags.authorNoteSent = false; 
+    } catch (e) { 
+      YX_HELPERS.log('Author note clear failed:', e.message); 
+    } 
+  },
+
+  generateContextual: function(actionType, engagement, inputDepth) { 
+    const cfg = state.yingxue.config.authorNotes || { enabled: true, mode: 'adaptive', maxLength: 200 }; 
+    if (cfg.mode === 'off') return null; 
+    let note = null;
+
+    switch (actionType) {
+      case 'intimate': note = 'Intimate action attempted. Focus on emotional reactions and body language.'; break;
+      case 'emotional': note = 'Emotional vulnerability shown. React genuinely based on personality.'; break;
+      case 'social': note = 'Social interaction—let personality guide reaction.'; break;
+      case 'assertive': note = 'Assertive action—show immediate reaction, no auto-compliance.'; break;
+      case 'risky': note = 'Dangerous action—describe consequences and resistance.'; break;
+    }
+
+    if (inputDepth === 'rich' || inputDepth === 'immersive') note = (note || '') + ' Match the detailed tone of the input.';
+
+    // Low-engagement initiative
+    if (engagement <= (state.yingxue.config.proactivity?.triggerThreshold ?? -2) && !note) {
+      note = 'Low engagement: character should take meaningful initiative.';
+    }
+
+    // Append subtext guidance (safe append)
+    if (state.yingxue.lastSubtext?.detected) {
+      const sub = YX_SUBTEXT.generateSubtextGuidance(state.yingxue.lastSubtext);
+      if (sub) note = note ? (note + ' ' + sub) : sub;
+    }
+
+    // Sensory / intimacy enhancers (keep very short) with cooldown
+    try {
+      const turnSince = state.yingxue.turn - (state.yingxue.flags._lastEnhancerTurn || -999);
+      if (state.yingxue.config.intimateEnhancers && state.yingxue.currentScene?.intimacyLevel >= 3 && ['intimate','emotional'].includes(actionType) && turnSince > 2) {
+        const moods = {
+          'neutral': 'a soft glow of candlelight',
+          'nervous': "a quickening pulse in the quiet",
+          'playful': "a teasing breeze at the window",
+          'hopeful': "a warm hush in the room",
+          'mysterious': "shadows leaning in at the corners"
+        };
+        const enhancer = moods[state.yingxue.currentMood] || 'an intimate hush';
+        note = (note || '') + ` Mood enhancer: ${enhancer}.`;
+        state.yingxue.flags._lastEnhancerTurn = state.yingxue.turn;
+      }
+    } catch (e) {
+      YX_HELPERS.log('Enhancer attach failed:', e.message);
+    }
+
+    // Add emotional momentum context
+    const momentum = state.yingxue.emotionalMomentum;
+    if (momentum && momentum.type && momentum.strength > 2) {
+      const momentumNotes = {
+        'romantic_buildup': 'Building romantic tension—escalate naturally or create meaningful pause.',
+        'romantic_tension': 'Romantic conflict present—address underlying feelings.',
+        'dramatic_tension': 'High drama—characters should react emotionally, not logically.',
+        'emotional_bonding': 'Emotional connection building—deepen intimacy through vulnerability.',
+        'obsessive_spiral': 'Obsession rising—hint at darker impulses without breaking immersion.'
+      };
+      if (momentumNotes[momentum.type]) {
+        note = note ? `${note} ${momentumNotes[momentum.type]}` : momentumNotes[momentum.type];
+      }
+    }
+
+    // Add scene pacing hints
+    if (state.yingxue.turn > 5 && !actionType) {
+      note = note ? `${note} Consider scene transition or character initiative.` : 'Scene may need progression or character-driven action.';
+    }
+
+    // Add perspective guidance when in first-person mode
+    if (state.yingxue.config.perspective === 'first') {
+      note = (note || '') + ' Respond in first-person narration, revealing inner thoughts.';
+    }
+
+    if (!note) return null;
+    return note.slice(0, cfg.maxLength).trim();
+
+  } 
+};
+
+// ---------------- Narrative Hinting ---------------- 
+const YX_NARRATIVE = { 
+  generateHints: function(actionType, engagement, inputDepth, subtextData) { 
+    const hints = []; 
+    const cfg = state.yingxue.config; 
+    switch (actionType) { 
+      case 'intimate': hints.push('NARR: Intimate attempt - focus on emotions'); break; 
+      case 'emotional': hints.push('NARR: Vulnerability - respond based on personality'); break; 
+      case 'social': hints.push('NARR: Social interaction - authentic response'); break; 
+      case 'assertive': hints.push('NARR: Assertive - show resistance or compliance'); break; 
+      case 'risky': hints.push('NARR: Risky - realistic consequences'); break; 
+      default: if (inputDepth === 'thoughtful' || inputDepth === 'rich') hints.push('NARR: Detailed input - match nuance'); 
+    } 
+    if (subtextData && subtextData.detected) { 
+      for (const t of subtextData.types) { 
+        hints.push(`SUBTEXT: ${t.replace(/_/g, ' ')}`); 
+      } 
+    } 
+    if (inputDepth === 'immersive' || inputDepth === 'masterful') hints.push('PACING: High input depth - respond with equal sophistication'); 
+    const tension = state.yingxue.relationshipTension; 
+    if (tension > 7) hints.push('TENSION: Very high - charged atmosphere'); 
+    else if (tension > 4) hints.push('TENSION: Elevated - undercurrents present'); 
+    else if (tension < -2) hints.push('TENSION: Low - relaxed dynamic'); 
+    if (engagement >= state.yingxue.config.engagement.max - 1) hints.push('PACING: High engagement - sustain intensity'); 
+    else if (engagement <= state.yingxue.config.engagement.min + 1) hints.push('PACING: Low engagement - character initiative encouraged'); 
+    const primary = YX_CHARACTERS.getPrimaryCharacter(); 
+    if (primary && primary.history.length > 3) hints.push('MEMORY: Reference previous interactions for consistency'); 
+    // intimate descriptor enhancer 
+    try { 
+      if (cfg.intimateEnhancers && actionType === 'intimate' && state.yingxue.currentScene?.intimacyLevel >= 3) { 
+        const desc = (state.yingxue.relationshipTension > 4) ? 'charged with unspoken desire' : 'tender and exploratory'; 
+        hints.push(`INTIMACY: ${desc}`); 
+      } 
+    } catch (e) { /* noop */ } 
+    return hints; 
+  } 
+};
+
+// ---------------- Engagement Update (single authority) ---------------- 
+const YX_ENGAGEMENT = { 
+  updateFromInput: function(cleanText, originalText) { 
+    const cfg = state.yingxue.config.engagement; 
+    const inputDepth = YX_HELPERS.assessInputDepth(cleanText); 
+    const at = YX_HELPERS.detectActionType(cleanText); 
+    const actionType = Array.isArray(at) ? at[0] : at;
+
+    if (cfg.decayPerTurn > 0) {
+      if (state.yingxue.engagement > 0) state.yingxue.engagement = Math.max(0, state.yingxue.engagement - cfg.decayPerTurn);
+      else if (state.yingxue.engagement < 0) state.yingxue.engagement = Math.min(0, state.yingxue.engagement + cfg.decayPerTurn);
+    }
+
+    const depthBonus = { 'empty': -2, 'minimal': -1, 'passive': 0, 'basic': 1, 'thoughtful': 2, 'rich': 3, 'immersive': 4, 'masterful': 5, 'nuanced': 4 };
+    const bonus = depthBonus[inputDepth] || 1;
+    state.yingxue.engagement += bonus;
+
+    // boost if any emotional/intimate present in multi-detect
+    if (at) {
+      const types = Array.isArray(at) ? at : [at];
+      if (types.some(t => ['intimate', 'emotional'].includes(t))) {
+        state.yingxue.engagement += 1;
+      }
+    }
+
+    const hasDebuff = state.yingxue.playerStatus.some(s => ['injured', 'exhausted', 'bleeding', 'poisoned'].includes(s));
+    if (hasDebuff) state.yingxue.engagement -= 1;
+
+    state.yingxue.engagement = Math.max(cfg.min, Math.min(cfg.max, state.yingxue.engagement));
+    state.yingxue.lastInputDepth = inputDepth;
+
+  } 
+};
+
+// ---------------- Snapshot helpers for rollbacks ---------------- 
+globalThis.YINGXUE_PUSH_STATE = function() { 
+  try { 
+    state.yingxue.stateStack = state.yingxue.stateStack || []; 
+    const snap = { 
+      turn: state.yingxue.turn, 
+      engagement: state.yingxue.engagement, 
+      relationshipTension: state.yingxue.relationshipTension, 
+      emotionalMomentum: JSON.parse(JSON.stringify(state.yingxue.emotionalMomentum || {type:null,strength:0,decay:0.6})), 
+      currentMood: state.yingxue.currentMood, 
+      characters: state.yingxue.config.compactMode ? null : JSON.parse(JSON.stringify(state.yingxue.characters || {})) 
+    }; 
+    state.yingxue.stateStack.push(snap); 
+    if (state.yingxue.stateStack.length > 6) state.yingxue.stateStack.shift(); 
+    return true; 
+  } catch (e) { 
+    YX_HELPERS.log('Push state failed:', e.message); 
+    return false; 
+  } 
+};
+
+globalThis.YINGXUE_RESTORE_LAST = function() { 
+  try { 
+    state.yingxue.stateStack = state.yingxue.stateStack || []; 
+    const snap = state.yingxue.stateStack.pop(); 
+    if (!snap) { 
+      console.log('[YINGXUE] No state snapshot to restore'); 
+      return false; 
+    } 
+    state.yingxue.turn = snap.turn; 
+    state.yingxue.engagement = snap.engagement; 
+    state.yingxue.relationshipTension = snap.relationshipTension; 
+    state.yingxue.emotionalMomentum = snap.emotionalMomentum; 
+    state.yingxue.currentMood = snap.currentMood; 
+    if (snap.characters) state.yingxue.characters = snap.characters; 
+    console.log('[YINGXUE] Restored previous state snapshot'); 
+    return true; 
+  } catch (e) { 
+    console.error('[YINGXUE] Restore failed:', e); 
+    return false; 
+  } 
+};
+
+// ---------------- Main Handlers (mode-aware) ---------------- 
+globalThis.YINGXUE_INPUT = function(text, meta) { 
+  try { 
+    // ensure cache early 
+    if (!globalThis.YINGXUE_CACHE) YINGXUE_REBUILD_CACHE(); 
+    const cfg = state.yingxue.config || {}; 
+    const originalText = text || '';
+
+    // infer input mode before changing turn counts
+    const inputMode = cfg.handleModes ? YX_HELPERS.inferInputMode(originalText, meta) : 'do';
+    state.yingxue.flags.lastInputMode = inputMode;
+
+    if (cfg.handleModes && inputMode === 'see') {
+      state.yingxue.flags.isSeeMode = true;
+      // Light-clean and tag for Context but do not count as a full narrative turn
+      return `[Visual Prompt] ${YX_HELPERS.cleanFillers(originalText)}`;
+    }
+if (cfg.handleModes && inputMode === 'story') {
+  // narrative insertion — gentle updates to evolve state without full inflation
+  state.yingxue.lastActionType = 'narrative_shift';
+  state.yingxue.relationshipTension *= 0.85;
+  YX_TENSION.updateTension(null, 'rich', null); // Assume richer depth for story
+
+  // Light state refresh: extract & update location/mood/subtext
+  const storySubtext = YX_SUBTEXT.detectSubtext(originalText);
+  state.yingxue.lastSubtext = storySubtext;
+  if (storySubtext.detected) {
+    // Derive mood from subtext (e.g., playful → 'playful')
+    const inferredMood = storySubtext.types.includes('emotional_inflation') ? 'playful' : 'neutral';
+    state.yingxue.currentMood = inferredMood;
   }
 
-  const S = YG_STATE;
-  const L = YG_LIB;
-
-  // Helper to mark dirty
-  function mark(field) {
-    S.dirty = S.dirty || {};
-    S.dirty[field] = true;
+  const storyLocation = YX_HELPERS.extractLocation(originalText, 'input');
+  if (storyLocation && storyLocation !== state.yingxue.currentLocation) {
+    state.yingxue.currentLocation = storyLocation;
+    state.yingxue.flags.locationChanged = true;
+    state.yingxue.metrics.locationChanges++;
+    YX_HELPERS.log('Story location updated to:', storyLocation);
   }
 
-  // Process last input for time and location updates based on verbs
-  function processLastInputIfPresent(){
-    if(S.lastAction && S._lastInputMeta){
-      const verbs = S._lastInputMeta.verbs || [];
-      if(verbs.includes("rest") || verbs.includes("sleep")){
-        S.timeOfDay = "night";
-        mark("timeOfDay");
-      } else if(verbs.includes("travel") || verbs.includes("go")){
-        if(L.randChance(0.5)){
-          S.timeOfDay = ["dawn", "morning", "noon", "afternoon", "dusk", "night"][Math.floor(Math.random()*6)];
-          mark("timeOfDay");
+  // Fractional turn/time advance (0.5) to evolve without full tick
+  state.yingxue.turn += 0.5;
+  state.yingxue.metrics.totalTurns += 0.5;
+  YX_TIME.advance(0.5); // Partial phase shift
+
+  // Push light snapshot
+  if (typeof YINGXUE_PUSH_STATE_MIN === 'function') YINGXUE_PUSH_STATE_MIN();
+
+  // Add narrative hint to author note
+  const narrativeNote = YX_AUTHOR_NOTES.generateContextual('narrative_shift', state.yingxue.engagement, 'rich');
+  if (narrativeNote) YX_AUTHOR_NOTES.send(narrativeNote);
+
+  return originalText; // Still passthrough
+}
+
+    // default behavior (do / say) — now increment turn
+    state.yingxue.turn++; state.yingxue.metrics.totalTurns++;
+    state.yingxue.flags.locationChanged = false; state.yingxue.flags.authorNoteSent = false;
+
+    let cleaned = YX_HELPERS.normalizePronouns(originalText);
+    cleaned = YX_HELPERS.cleanFillers(cleaned);
+
+    // Engagement & detection (single source)
+    YX_ENGAGEMENT.updateFromInput(cleaned, originalText);
+    const actionDetected = YX_HELPERS.detectActionType(cleaned); // string | array | null
+
+    // store lastActionTypes for richer decisions
+    state.yingxue.lastActionTypes = Array.isArray(actionDetected) ? actionDetected : (actionDetected ? [actionDetected] : []);
+    const primaryAction = state.yingxue.lastActionTypes[0] || null;
+    state.yingxue.lastActionType = primaryAction || 'character_action';
+
+    const inputDepth = state.yingxue.lastInputDepth;
+    const subtextData = YX_SUBTEXT.detectSubtext(originalText);
+
+    state.yingxue.lastSubtext = subtextData;
+
+    // tension uses the full array where possible
+    YX_TENSION.updateTension(state.yingxue.lastActionTypes, inputDepth, subtextData);
+
+    const charName = YX_HELPERS.extractCharacterName(originalText);
+    if (charName) {
+      YX_CHARACTERS.updateCharacterMemory(charName, (primaryAction || 'action') + '_attempted');
+      state.yingxue.currentScene.primaryCharacter = charName;
+    }
+
+const newLocation = YX_HELPERS.extractLocation(originalText, 'input');
+if (newLocation && newLocation !== state.yingxue.currentLocation) {
+  state.yingxue.currentLocation = newLocation;
+  state.yingxue.flags.locationChanged = true;
+  state.yingxue.metrics.locationChanges++;
+  YX_HELPERS.log('Location changed to:', newLocation);
+} else if (state.yingxue.currentLocation === "null") {
+  state.yingxue.currentLocation = 'an unknown place'; // Reset stale mod artifact
+  YX_HELPERS.log('Location reset to default (cleaned stale "null")');
+}
+
+    const timeCfg = state.yingxue.config.timeCycle;
+    if (timeCfg.advanceOn === 'input') YX_TIME.advance(1);
+
+    let needsPrefix = (state.yingxue.lastInputDepth === 'minimal' || state.yingxue.lastInputDepth === 'basic');
+    const inferredMode = inputMode || 'do';
+    if (inferredMode === 'say' && needsPrefix) {
+      needsPrefix = false;
+    } else if (needsPrefix && cleaned.trim().length > 5) cleaned = '[Action] ' + cleaned;
+
+    state.yingxue.flags.lastInputText = originalText; // Persist for CONTEXT
+
+    YX_HELPERS.log('Input processed. Mode:', inferredMode, 'Action:', state.yingxue.lastActionType, 'Depth:', state.yingxue.lastInputDepth, 'Tension:', state.yingxue.relationshipTension);
+    if (subtextData.detected) YX_HELPERS.log('Subtext:', subtextData.types.join(', '), 'Confidence:', subtextData.confidence);
+    return cleaned;
+
+  } catch (e) { 
+    YX_HELPERS.log('INPUT processing failed:', e.message); 
+    return text || ''; 
+  } 
+};
+
+// Return shape [text, stop] — compatible with AutoCards and your context modifier 
+globalThis.YINGXUE_CONTEXT = function(text, stop) { 
+  try { 
+    if (!globalThis.YINGXUE_CACHE) YINGXUE_REBUILD_CACHE(); 
+    YX_HELPERS.syncState(); // Sync pre-build
+    const timeInfo = YX_TIME.getCurrentPhase(); 
+    const cfg = state.yingxue.config; 
+    const systemParts = []; 
+
+    const timeStr = `Time: ${timeInfo.phase} (Day ${timeInfo.day})`; 
+    const moodStr = `Mood: ${state.yingxue.currentMood}`; 
+
+    // Always include time + mood
+    systemParts.push(`${timeStr} | ${moodStr}`);
+
+    // Only include location if one is actually set, with fallback heuristic if vague
+    let effectiveLoc = state.yingxue.currentLocation;
+    if (!effectiveLoc || effectiveLoc === 'an unknown place' || effectiveLoc === 'null') {
+      // Quick heuristic: infer from text or lastOutputText
+      effectiveLoc = YX_HELPERS.extractLocation(text, 'output') || 
+                     YX_HELPERS.extractLocation(state.yingxue.flags.lastOutputText || '', 'output') || 
+                     'a familiar setting'; // Ultra-safe default
+      state.yingxue.currentLocation = effectiveLoc; // Persist for next
+      YX_HELPERS.log('Context loc fallback:', effectiveLoc);
+    }
+    
+    if (effectiveLoc) {
+      const locStr = `Location: ${effectiveLoc}`;
+      systemParts.unshift(locStr); // Front-load for priority
+    }
+
+    if (state.yingxue.playerStatus.length > 0) {
+      systemParts.push(`Status: ${state.yingxue.playerStatus.join(', ')}`);
+    }
+
+
+    // Mode tag for Context
+    if (cfg.handleModes && state.yingxue.flags.isSeeMode) {
+      systemParts.push('Mode: SEE - Describe image evocatively');
+    }
+
+    const narrativeHints = YX_NARRATIVE.generateHints(
+      state.yingxue.lastActionType,
+      state.yingxue.engagement,
+      state.yingxue.lastInputDepth,
+      state.yingxue.lastSubtext
+    );
+
+    // Merge hints (limit them to avoid bloat)
+    let hints = Array.isArray(narrativeHints) ? narrativeHints.slice(0, cfg.maxSystemHints) : [];
+    // Include relationship context if primary char exists
+    const primary = YX_CHARACTERS.getPrimaryCharacter();
+    if (primary) {
+      const relCtx = YX_CHARACTERS.getRelationshipContext(primary.name);
+      if (relCtx) hints.unshift(`Character: ${primary.name} (${relCtx.relationship}, ${relCtx.intimacy})`);
+    }
+
+    // Combine system parts + hints
+    const allParts = [...systemParts, ...hints];
+    // Build system block using configured tag
+    const tag = (cfg.systemTag || 's').replace(/[<>]/g, '');
+    let systemBlock;
+    if (cfg.systemMode === 'minimal') systemBlock = `<${tag}>${allParts[0]}</${tag}>\n\n`;
+    else if (cfg.systemMode === 'verbose') systemBlock = `<${tag}>\n${allParts.join('\n')}\n</${tag}>\n\n`;
+    else systemBlock = `<${tag}>${allParts.join(' | ')}</${tag}>\n\n`;
+
+    // Cap size — trim trailing parts if needed
+    if (systemBlock.length > cfg.maxSystemChars) {
+      const limited = allParts.slice(0, cfg.maxSystemHints).join(' | ');
+      systemBlock = `<${tag}>${limited}</${tag}>\n\n`;
+    }
+
+    // Author note generation (trimmed)
+    const originalText = state.yingxue.flags.lastInputText || text;
+    const authorNote = YX_AUTHOR_NOTES.generateContextual(
+      state.yingxue.lastActionType,
+      state.yingxue.engagement,
+      state.yingxue.lastInputDepth
+    );
+    if (authorNote) YX_AUTHOR_NOTES.send(authorNote);
+
+    return [systemBlock + text, stop];
+
+  } catch (e) { 
+    YX_HELPERS.log('CONTEXT processing failed:', e.message); 
+    return [text, stop]; 
+  } 
+};
+
+// OUTPUT core 
+globalThis.YINGXUE_OUTPUT = function(text, meta) { 
+  try { 
+    const prevText = state.yingxue.flags.lastOutputText; 
+    const playerAction = (meta && meta.playerAction) || (globalThis.AIDungeon && globalThis.AIDungeon.currentAction) || state.yingxue.flags.lastPlayerAction || 'turn'; 
+    state.yingxue.flags.lastPlayerAction = playerAction;
+
+    // Handle erase -> rollback
+    if (playerAction === 'erase') {
+      if (state.yingxue.stateStack && state.yingxue.stateStack.length > 0) {
+        const priorState = state.yingxue.stateStack.pop();
+        state.yingxue.emotionalMomentum = priorState.emotionalMomentum || { type: null, strength: 0 };
+        state.yingxue.relationshipTension = priorState.relationshipTension || 0;
+        state.yingxue.turn = priorState.turn || Math.max(0, state.yingxue.turn - 1);
+      } else {
+        state.yingxue.turn = Math.max(0, state.yingxue.turn - 1);
+        state.yingxue.relationshipTension *= 0.9;
+      }
+      YX_AUTHOR_NOTES.clear();
+      YX_HELPERS.log('Erase rollback applied');
+      return text;
+    }
+
+    // Retry gating: skip double updates if identical
+    if (playerAction === 'retry' && text === prevText) {
+      YX_HELPERS.log('Retry detected: skipping duplicate update');
+      return text;
+    }
+
+    // Continue: passive update
+    if (playerAction === 'continue') {
+      try { YX_ENGAGEMENT.updateFromInput('continue', ''); } catch (e) {}
+      state.yingxue.lastInputDepth = 'passive';
+      state.yingxue.lastActionType = 'extend_scene';
+      try { YX_TENSION.updateTension(['social'], 'basic', null); } catch (e) {}
+      // count continue as a turn if desired — here we advance to keep pacing consistent
+      state.yingxue.turn++;
+      YX_HELPERS.log('Continue: Pseudo-update applied');
+    }
+
+    // Clean out any [Action] artifacts
+    text = (text || '').replace(/\[Action\]\s*/g, '');
+
+    const newLocation = YX_HELPERS.extractLocation(text, 'output');
+    if (newLocation && newLocation !== state.yingxue.currentLocation) {
+      state.yingxue.currentLocation = newLocation;
+      state.yingxue.flags.locationChanged = true;
+      state.yingxue.metrics.locationChanges++;
+      YX_HELPERS.log('Location detected in output:', newLocation);
+    }
+
+    const timeCfg = state.yingxue.config.timeCycle;
+    if (timeCfg.advanceOn === 'locationChange' && state.yingxue.flags.locationChanged) YX_TIME.advance(1);
+
+    if (!state.yingxue.config.debug) {
+      const tag = (state.yingxue.config.systemTag || 's').replace(/[<>]/g, '');
+      const re = new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>\\n*`, 'g');
+      text = text.replace(re, '');
+    }
+
+    // Push to stack for potential erases (limit depth)
+    if (playerAction === 'turn' || playerAction === 'continue') {
+      state.yingxue.turn++; // Force advance for 'turn' (missing before)
+      state.yingxue.metrics.totalTurns++;
+      state.yingxue.stateStack.push({
+        emotionalMomentum: JSON.parse(JSON.stringify(state.yingxue.emotionalMomentum || {type:null,strength:0,decay:0.6})),
+        relationshipTension: state.yingxue.relationshipTension,
+        turn: state.yingxue.turn
+      });
+      if (state.yingxue.stateStack.length > 6) state.yingxue.stateStack.shift();
+    }
+
+    // Update memory from response (gated for retry)
+    if (!(playerAction === 'retry' && text === prevText)) {
+      const primary = YX_CHARACTERS.getPrimaryCharacter();
+      if (primary) {
+        const responseType = YX_HELPERS.analyzeCharacterResponse(text);
+        YX_CHARACTERS.updateCharacterMemory(primary.name, responseType);
+        const mood = YX_TENSION.getMoodContagion(state.yingxue.currentMood, state.yingxue.lastActionType);
+        if (mood !== state.yingxue.currentMood) {
+          state.yingxue.currentMood = mood;
+          YX_HELPERS.log('Mood contagion applied:', mood);
+        }
+
+        // Update emotional momentum
+        YX_MOMENTUM.update(state.yingxue.lastActionType, responseType);
+      }
+    }
+
+    // cleanup
+    YX_AUTHOR_NOTES.clear();
+    state.yingxue.lastActionType = null;
+    state.yingxue.lastActionTypes = [];
+    state.yingxue.flags.locationChanged = false;
+    state.yingxue.flags.isSeeMode = false;
+    state.yingxue.flags.lastOutputText = text;
+
+    YX_HELPERS.log('Output done. Engagement:', state.yingxue.engagement, 'Tension:', state.yingxue.relationshipTension, 'Action:', playerAction);
+    return text;
+
+  } catch (e) { 
+    YX_HELPERS.log('OUTPUT processing failed:', e.message); 
+    return text; 
+  } 
+};
+
+// ---------------- API / Utilities ---------------- 
+globalThis.YINGXUE_INIT = function() { 
+  try { 
+    YX_HELPERS.log('Initializing YINGXUE...'); 
+    YINGXUE_REBUILD_CACHE(); 
+    state.yingxue._initialized = true; 
+    const timeInfo = YX_TIME.getCurrentPhase(); 
+    YX_HELPERS.log(`Initialized. Time: ${timeInfo.phase} (Day ${timeInfo.day})`); 
+    return true; 
+  } catch (e) { 
+    console.error('[YINGXUE] Init failed:', e); 
+    return false; 
+  } 
+};
+
+if (!state.yingxue._initialized) YINGXUE_INIT();
+
+globalThis.YINGXUE_STATUS = function() { 
+  const yx = state.yingxue; 
+  const timeInfo = YX_TIME.getCurrentPhase(); 
+  console.log('=== YINGXUE STATUS ==='); 
+  console.log('Turn:', yx.turn); 
+  console.log(`Time: ${timeInfo.phase} (Day ${timeInfo.day}, Tick ${timeInfo.tick})`); 
+  console.log('Location:', yx.currentLocation || '— not set —');
+  console.log('Mood:', yx.currentMood); 
+  console.log(`Engagement: ${yx.engagement} (${yx.config.engagement.min}..${yx.config.engagement.max})`); 
+  console.log('Player Status:', yx.playerStatus.join(', ') || 'None'); 
+  console.log('Last Action Type:', yx.lastActionType || 'None'); 
+  console.log('Last Player Action:', yx.flags.lastPlayerAction || 'None'); 
+  console.log('Relationship Tension:', yx.relationshipTension); 
+  console.log('Metrics:', yx.metrics); 
+  console.log('Cache Version:', yx._cacheVersion); 
+  console.log('Primary Character:', YX_CHARACTERS.getPrimaryCharacter()?.name || 'None'); 
+  const mom = yx.emotionalMomentum; 
+  console.log(`Momentum: ${mom.type || 'none'} (${mom.strength.toFixed(1)})`); 
+  console.log('----------------------'); 
+};
+
+// small compatibility helpers (optional) 
+globalThis.YINGXUE_RESET = function() { 
+  try { 
+    delete state.yingxue; 
+    YX_HELPERS.log('State cleared; reinitializing...'); 
+    YINGXUE_INIT(); 
+    return true; 
+  } catch (e) { 
+    return false; 
+  } 
+};
+
+globalThis.YINGXUE_TOGGLE_FIRST_PERSON = function() { 
+  state.yingxue.config.perspective = state.yingxue.config.perspective === 'first' ? 'second' : 'first'; 
+  console.log(`Perspective: ${state.yingxue.config.perspective}-person mode ON`); 
+};
+
+globalThis.YINGXUE_TOGGLE_COMPACT = function() { 
+  state.yingxue.config.compactMode = !state.yingxue.config.compactMode; 
+  console.log('Compact mode:', state.yingxue.config.compactMode ? 'ON (lean & mean)' : 'OFF (full history)'); 
+};
+
+globalThis.YINGXUE_QUICK_STATUS = function() { 
+  const yx = state.yingxue; 
+  const mom = yx.emotionalMomentum; 
+  console.log(`Turn ${yx.turn} | Mood: ${yx.currentMood} | Eng: ${yx.engagement} | Ten: ${yx.relationshipTension} | Mom: ${mom.type || 'none'} (${mom.strength.toFixed(1)})`); 
+  console.log('Location:', yx.currentLocation); 
+  const primary = YX_CHARACTERS.getPrimaryCharacter(); 
+  if (primary) console.log(`${primary.name}: rel ${primary.rel || 0}, int ${primary.int || 0}, traits: ${primary.traits.join(', ')}`); 
+};
+
+YX_HELPERS.log('YINGXUE v3.2c patched loaded (multi-detect, safer pronouns, enhancer cooldown, modes & actions resilience)');
+
+// ---------- Ephemeral / Prune Patch (drop-in) ----------
+(function(){
+  if (!state) state = {};
+  state.yingxue = state.yingxue || {};
+  state.yingxue.config = state.yingxue.config || {};
+  // defaults (change these)
+  state.yingxue.config.memoryRetentionTurns = state.yingxue.config.memoryRetentionTurns ?? 3; // keep 3 turns of char history by default
+  state.yingxue.config.snapshotLimit = state.yingxue.config.snapshotLimit ?? 3; // small snapshots
+  state.yingxue.config.pruneThresholdChars = state.yingxue.config.pruneThresholdChars ?? 50000; // if state string > this, aggressive prune
+  state.yingxue.flags = state.yingxue.flags || {};
+
+  // small signature generator for output dedupe (cheap)
+  YX_HELPERS.outputSig = function(text) {
+    if (!text) return '';
+    const slice = text.slice(0, 200);
+    // cheap checksum: sum of char codes modulo large number
+    let s = 0;
+    for (let i = 0; i < slice.length; i++) s = (s*31 + slice.charCodeAt(i)) % 1000000007;
+    return `${slice.length}:${s}`;
+  };
+
+  // Minimal snapshot push / restore (store only essential fields)
+  globalThis.YINGXUE_PUSH_STATE_MIN = function() {
+    try {
+      state.yingxue.stateStack = state.yingxue.stateStack || [];
+      const snap = {
+        t: state.yingxue.turn,
+        eng: state.yingxue.engagement,
+        ten: state.yingxue.relationshipTension,
+        mom: state.yingxue.emotionalMomentum ? {...state.yingxue.emotionalMomentum} : {type:null,strength:0},
+        mood: state.yingxue.currentMood,
+        loc: state.yingxue.currentLocation,
+        primary: state.yingxue.currentScene?.primaryCharacter || null
+      };
+      state.yingxue.stateStack.push(snap);
+      if (state.yingxue.stateStack.length > (state.yingxue.config.snapshotLimit || 3)) state.yingxue.stateStack.shift();
+      return true;
+    } catch (e) {
+      YX_HELPERS.log('push_min failed:', e.message);
+      return false;
+    }
+  };
+
+  globalThis.YINGXUE_RESTORE_LAST_MIN = function() {
+    try {
+      state.yingxue.stateStack = state.yingxue.stateStack || [];
+      const snap = state.yingxue.stateStack.pop();
+      if (!snap) return false;
+      state.yingxue.turn = snap.t ?? state.yingxue.turn;
+      state.yingxue.engagement = snap.eng ?? state.yingxue.engagement;
+      state.yingxue.relationshipTension = snap.ten ?? state.yingxue.relationshipTension;
+      state.yingxue.emotionalMomentum = snap.mom ?? state.yingxue.emotionalMomentum;
+      state.yingxue.currentMood = snap.mood ?? state.yingxue.currentMood;
+      state.yingxue.currentLocation = snap.loc ?? state.yingxue.currentLocation;
+      state.yingxue.currentScene = state.yingxue.currentScene || {};
+      state.yingxue.currentScene.primaryCharacter = snap.primary ?? state.yingxue.currentScene.primaryCharacter;
+      return true;
+    } catch (e) {
+      YX_HELPERS.log('restore_min failed:', e.message);
+      return false;
+    }
+  };
+
+  // pruneState: removes stale characters, trims history, decays ephemeral fields
+  YX_HELPERS.pruneState = function(forceAggressive) {
+    try {
+      const cfg = state.yingxue.config;
+      const retain = Math.max(1, cfg.memoryRetentionTurns || 3);
+      const now = state.yingxue.turn || 0;
+
+      // Characters: drop or trim
+      const chars = state.yingxue.characters || {};
+      const keep = {};
+      for (const [name, c] of Object.entries(chars)) {
+        // prune if unseen for > retain turns AND no meaningful relationship/intimacy
+        const unseen = (now - (c.last || 0)) > retain;
+        const hasBond = (c.rel && Math.abs(c.rel) > 0) || (c.int && c.int > 0);
+        if (!unseen || hasBond) {
+          // trim history to last `retain` entries (or 3)
+          if (Array.isArray(c.history)) {
+            const maxHist = Math.max(1, retain);
+            c.history = c.history.slice(-maxHist);
+          }
+          // prune traits to small set
+          if (Array.isArray(c.traits) && c.traits.length > 5) c.traits = c.traits.slice(-5);
+          keep[name] = c;
+        } else {
+          // dropped — optional debug
+          YX_HELPERS.log(`Pruned character: ${name}`);
         }
       }
-      // Location update if input has "enter X"
-      const enterMatch = S.lastAction.match(/enter\s+(.+?)(?:\.|$)/i);
-      if(enterMatch){
-        S.location = enterMatch[1].trim();
-        mark("location");
+      state.yingxue.characters = keep;
+
+      // momentum: decay small strengths to zero
+      if (state.yingxue.emotionalMomentum) {
+        if ((state.yingxue.emotionalMomentum.strength || 0) < 0.5) {
+          state.yingxue.emotionalMomentum.type = null;
+          state.yingxue.emotionalMomentum.strength = 0;
+        }
       }
-      return true;
-    }
-    return false;
-  }
 
-  const didProcess = processLastInputIfPresent();
-
-  // Run enhanced cadence events
-  try {
-    L.checkCadenceEventsEnhanced();
-  } catch (e) {
-    log(`Cadence error: ${e.message}`, "error");
-  }
-
-  // Prune memories
-  try {
-    L.pruneMemories();
-  } catch (e) {
-    log(`Prune error: ${e.message}`, "error");
-  }
-
-  // Prune summaries to keep archive manageable
-  function pruneSummaries(){
-    if(S._archivedSummaries.length > 10){
-      S._archivedSummaries.shift();
-      mark("_archivedSummaries");
-    }
-    if(S._turnSummaryBuffer.length > 50){
-      const old = S._turnSummaryBuffer.shift();
-      S._archivedSummaries.push(old);
-      mark("_turnSummaryBuffer");
-    }
-  }
-  pruneSummaries();
-
-  // Recompose narrative summary and add digest every DIGEST_TURN_INTERVAL
-  try {
-    S._turnSummaryBuffer = S._turnSummaryBuffer || [];
-    if(S.turns % L.CONFIG.DIGEST_TURN_INTERVAL === 0 && S.lastAction && S.lastOutcome){
-      const digest = `T${S.turns}: ${YG_LIB.truncate(S.lastAction, 50)} -> ${YG_LIB.truncate(S.lastOutcome, 100)}`;
-      S._turnSummaryBuffer.push(digest);
-      L.addMemory({ text: `Digest: ${digest}`, tier: "medium", tags: ["digest"] });
-      L.api.generateNarrativeDigest(L.CONFIG.DIGEST_TURN_WINDOW);
-    }
-    S.narrativeSummary = S._turnSummaryBuffer.slice(-12).join(". ");
-    if (S.narrativeSummary && S.narrativeSummary.length > 1200) {
-      S.narrativeSummary = S.narrativeSummary.split(". ").slice(-8).join(". ");
-    }
-    mark("narrativeSummary");
-  } catch (e) {
-    log(`Summary error: ${e.message}`, "error");
-  }
-
-  // Update story card with latest narrative digest and keys
-  function updateStoryCard(){
-    if(!L.CONFIG.AUTO_STORYCARD_ENABLED) return;
-    const keys = S.currentGoals.concat(Object.keys(S.flags.storyFlags || {}).filter(k=> S.flags.storyFlags[k]));
-    const entry = S.narrativeSummary.slice(-800);
-    S.storyCard.keys = keys;
-    S.storyCard.entry = entry;
-    if(S.storyCard.index === undefined){
-      S.storyCard.index = addWorldEntry(keys, entry); // global API function, assumed defined externally
-    } else {
-      updateWorldEntry(S.storyCard.index, keys, entry);
-    }
-    mark("storyCard");
-  }
-
-  if (didProcess || (S.turns && S.turns % 3 === 0) || S.dirty.storyCard) {
-    try {
-      updateStoryCard();
-    } catch (e) {
-      log(`StoryCard update error: ${e.message}`, "error");
-    }
-  }
-
-  // Reset per-turn entity create count
-  S._entityCreateCount = 0;
-
-  // Handle auto-translate mode: override context with translation prompt if enabled and queue not empty
-  let ctx = "";
-  if(S.settings.translateAuto && S._translateQueue.length > 0){
-    const prompt = L.api.generateTranslationBatchPrompt();
-    if(prompt){
-      ctx = "You are a translator bot. Follow the instructions exactly.\n\n" + prompt;
-      S._translationMode = true;  // Flag output parser
-      mark("_translationMode");
-    }
-  } else {
-    // Normal context build
-    try {
-      ctx = L.api.buildCompactContext({ includeMemoryTop: 3 });
-    } catch (e) {
-      ctx = `T:${S.turns || 0} | TOD:${S.timeOfDay || "unk"} | W:${S.weather || "unk"}`;
-      log(`Context build error: ${e.message}`, "error");
-    }
-    // Append storyCard if available and dirty
-    if (S.dirty.storyCard && S.storyCard && S.storyCard.entry){
-      ctx += "\n\n=== STORYCARD ===\n" + L.truncate(S.storyCard.entry, 1600) + "\n=== END STORYCARD ===";
-    }
-    // Insert last input intent and verbs and dialogue info as intent block
-    let intentBlock = "";
-    if (S._lastInputAnalysis && S._lastInputAnalysis.intent && S._lastInputAnalysis.intent !== "neutral"){
-      intentBlock += `PLAYER_INTENT: ${S._lastInputAnalysis.intent}`;
-      if (S._lastInputAnalysis.clauses && S._lastInputAnalysis.clauses.length){
-        const verbs = S._lastInputAnalysis.clauses.map(c => c.verbs.join(",")).filter(Boolean).join("; ");
-        if (verbs) intentBlock += ` | VERBS: ${verbs}`;
+      // author notes & enhancer flags: make ephemeral
+      if (state.yingxue.flags && state.yingxue.flags._lastEnhancerTurn) {
+        if ((now - state.yingxue.flags._lastEnhancerTurn) > retain) {
+          delete state.yingxue.flags._lastEnhancerTurn;
+        }
       }
-      if (S._lastInputAnalysis.dialogues && S._lastInputAnalysis.dialogues.length){
-        intentBlock += ` | DIALOGUE: "${S._lastInputAnalysis.dialogues.join(" / ")}"`;
+      if (state.memory?.authorsNote) {
+        const noteTurn = state.yingxue.flags._lastAuthorNoteTurn || state.yingxue.turn;
+        if ((now - noteTurn) > retain) {
+          delete state.memory.authorsNote;
+          state.yingxue.flags.authorNoteSent = false;
+        }
       }
-      intentBlock += ` | INTENSITY: ${S._lastInputAnalysis.score || S._lastInputAnalysis.intensity || 40}`;
-      ctx = ctx.replace("===YCTX===\n", `===YCTX===\n${intentBlock}\n`);
-    }
-  }
 
-  // Tag last context provision time
-  S._lastContextProvidedAt = S.turns || 0;
-  mark("_lastContextProvidedAt");
-
-  // Save persistence
-  if(state && typeof state === "object"){
-    state.yg = S;
-  }
-
-  // Inject context in AI Dungeon memory if available
-  if(state.memory && typeof state.memory === "object"){
-    state.memory.context = ctx;
-  }
-
-  return { text: ctx || "=== YINGXUE CONTEXT ===\n(no context)\n=== END CONTEXT ===" };
-};
-
-// ===== Output Script: Yingxue Ultimate+ Outcome (Automated, Robust) =====
-// Processes AI output, updates memories/entities/flags/moods,
-// ingests translations, parses health/inventory/fame/infamy/relations.
-// Integrates with state/details/memory.
-
-YG_LIB && YG_LIB.api && YG_LIB.api.ensureState && YG_LIB.api.ensureState();
-
-const C = YG_LIB.api;
-
-// Try parse JSON from AI output for translation results
-function tryParseJSONFromAI(aiText){
-  try {
-    const jsonMatch = aiText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
-    if(!jsonMatch) return null;
-    return JSON.parse(jsonMatch[0]);
-  } catch(e){ return null; }
-}
-
-// Detect simple AI emotion from output text for companions/mood
-function detectAIEmotion(aiText){
-  const s = (aiText||"").toLowerCase();
-  if(/\b(angry|rage|furious)\b/.test(s)) return "angry";
-  if(/\b(sad|weep|cry|gloom|sorrow)\b/.test(s)) return "sad";
-  if(/\b(happy|joy|smile|laugh|delight)\b/.test(s)) return "happy";
-  if(/\b(explore|search|discover|investigate)\b/.test(s)) return "curious";
-  return "neutral";
-}
-
-// Main output processor
-function processAIOutput(aiText){
-  C.ensureState();
-
-  YG_STATE.lastOutcome = aiText || "";
-  YG_STATE.dirty.lastOutcome = true;
-
-  // Handle translation mode output: parse and apply translations
-  if(YG_STATE._translationMode){
-    const parsed = tryParseJSONFromAI(aiText || "");
-    if(parsed && Array.isArray(parsed)){
-      let handledTranslate = false;
-      for(const item of parsed){
-        if(item && item.id && item.zh){
-          const id = parseInt(item.id,10);
-          if(YG_STATE.memory && YG_STATE.memory[id]){
-            YG_STATE.memory[id].zh = item.zh;
-            YG_STATE.memory[id].zhPending = false;
-            YG_STATE.dirty.memory = true;
-            handledTranslate = true;
+      // aggressive fallback if state string is huge or forced
+      const stateSize = JSON.stringify(state.yingxue || {}).length;
+      if (forceAggressive || stateSize > (cfg.pruneThresholdChars || 50000)) {
+        // remove all but primary character, compress histories
+        const primary = YX_CHARACTERS.getPrimaryCharacter();
+        const newChars = {};
+        if (primary) {
+          const p = state.yingxue.characters[primary.name];
+          if (p) {
+            p.history = p.history ? p.history.slice(-1) : [];
+            p.traits = p.traits ? p.traits.slice(-3) : [];
+            newChars[primary.name] = p;
           }
         }
+        state.yingxue.characters = newChars;
+        // reduce stack
+        state.yingxue.stateStack = (state.yingxue.stateStack || []).slice(-1);
+        // drop large fields
+        state.yingxue._cacheVersion = state.yingxue._cacheVersion || 0;
+        YX_HELPERS.log('Aggressive prune applied; new size approx', JSON.stringify(state.yingxue).length);
       }
-      if(handledTranslate){
-        YG_STATE._translateQueue = (YG_STATE._translateQueue||[]).filter(i => !(parsed.some(p => parseInt(p.id,10) === i)));
-        YG_STATE._translationMode = false;
-        YG_STATE.dirty._translateQueue = true;
-        state.message = "Translations processed automatically.";
-        return ""; // suppress output since handled silently
-      }
+      return true;
+    } catch (e) {
+      YX_HELPERS.log('Prune failed:', e.message);
+      return false;
     }
-    log("Translation mode: Failed to parse JSON.", "warn");
-    return aiText;
+  };
+
+  // Integrate prune into the output flow: call at end of YINGXUE_OUTPUT (if present)
+  // We will patch/wrap if YINGXUE_OUTPUT_CORE exists as in your patched library.
+  if (typeof globalThis.YINGXUE_OUTPUT === 'function' && !globalThis.YINGXUE_OUTPUT_PRUNE_WRAPPED) {
+    globalThis.YINGXUE_OUTPUT_PRUNE_WRAPPED = true;
+    const core = globalThis.YINGXUE_OUTPUT;
+    globalThis.YINGXUE_OUTPUT = function(text, meta) {
+      try {
+        // cheap dedupe: if same signature as previous, skip memory update (core should already gate)
+        const sig = YX_HELPERS.outputSig(text);
+        if (sig && sig === state.yingxue.flags._lastOutputSig) {
+          // call core but do not double-update complex memory (core should already gate)
+          const out = core(text, meta);
+          // still prune lightly (no force)
+          YX_HELPERS.pruneState(false);
+          return out;
+        }
+        // push a minimal snapshot before we mutate
+        YINGXUE_PUSH_STATE_MIN();
+        const out = core(text, meta);
+        // store last signature
+        state.yingxue.flags._lastOutputSig = sig;
+        // prune after output (normal prune)
+        YX_HELPERS.pruneState(false);
+
+        // optional: if state gets very large, run aggressive prune
+        const size = JSON.stringify(state.yingxue || {}).length;
+        if (size > (state.yingxue.config.pruneThresholdChars || 50000)) {
+          YX_HELPERS.pruneState(true);
+        }
+        return out;
+      } catch (e) {
+        YX_HELPERS.log('OUTPUT prune wrapper failed:', e.message);
+        try { return core(text, meta); } catch (ee) { return text; }
+      }
+    };
   }
 
-  // Auto canonicalize entities from AI output (gentle mode)
-  const entities = C.autoCanonicalizeText(aiText || "", { createIfMissing: YG_STATE.settings && YG_STATE.settings.entityStrictness === "gentle" });
+  // expose a manual prune function
+  globalThis.YINGXUE_PRUNE_NOW = function(aggressive) {
+    return YX_HELPERS.pruneState(!!aggressive);
+  };
 
-  // Add AI outcome memory (medium tier if long text)
-  const tier = (aiText && aiText.length > 200) ? "medium" : "short";
-  C.addMemory({ text: `AI Outcome: ${YG_LIB.truncate(aiText, 300)}`, tier, tags:["outcome"], kind:"outcome", source:"ai" });
+  YX_HELPERS.log('Ephemeral-prune patch loaded (retentionTurns=' + (state.yingxue.config.memoryRetentionTurns||3) + ')');
+})();
+// === Compatibility wrapper for YINGXUE_CONTEXT (coerce to string, avoid heavy injection on first turn)
+globalThis.YINGXUE_CONTEXT_SAFE = function(text, stop) {
+  try {
+    // ensure cache and sync
+    if (!globalThis.YINGXUE_CACHE) YINGXUE_REBUILD_CACHE();
+    if (typeof YX_HELPERS !== 'undefined' && YX_HELPERS.syncState) YX_HELPERS.syncState();
 
-  // Detect AI output emotion and update companion moods & entity salience
-  const emotion = detectAIEmotion(aiText || "");
-  for(const e of entities || []){
-    if(e){
-      e.salience = Math.min(9999, (e.salience||0) + 2);
-      YG_STATE.dirty.entities = true;
+    const cfg = state.yingxue?.config || {};
+    // Build the systemParts similarly to your v3.2c but guarded & trimmed
+    const timeInfo = (typeof YX_TIME !== 'undefined' && YX_TIME.getCurrentPhase) ? YX_TIME.getCurrentPhase() : {day:1, phase:''};
+    const moodPart = `Mood: ${state.yingxue.currentMood || ''}`;
+    let systemParts = [];
+
+    // Only include time/location if explicitly allowed AND not the very first prompt
+    const initialPrompt = ((state.yingxue.metrics?.totalTurns || 0) === 0 || state.yingxue.turn <= 1);
+    if (!initialPrompt && cfg.enableTime) {
+      systemParts.push(`Time: ${timeInfo.phase} (Day ${timeInfo.day})`);
     }
-    const comp = (YG_STATE.companions||[]).find(c => c.name === (e.canonicalName || "") || (e.aliases && e.aliases.includes(c.name)));
-    if(comp && emotion && comp.mood !== emotion){
-      comp.mood = emotion;
-      YG_STATE.dirty.companions = true;
-      C.addMemory({ text: `Companion ${comp.name} mood changed to ${emotion} (AI outcome).`, tier:"short", tags:["companion","mood"], kind:"companion", source:"ai", entity: comp.name });
+    if (!initialPrompt && cfg.enableLocation && state.yingxue.currentLocation) {
+      systemParts.push(`Location: ${state.yingxue.currentLocation}`);
     }
+    // Always include mood (safe, short)
+    systemParts.push(moodPart);
+
+    // Add status and a few narrative hints but keep it tiny
+    if (state.yingxue.playerStatus?.length) systemParts.push(`Status: ${state.yingxue.playerStatus.join(', ')}`);
+    const narrativeHints = (typeof YX_NARRATIVE !== 'undefined') ? YX_NARRATIVE.generateHints(state.yingxue.lastActionType, state.yingxue.engagement, state.yingxue.lastInputDepth) : [];
+    // take at most 2 hints to avoid bloat
+    if (Array.isArray(narrativeHints) && narrativeHints.length) systemParts.push(narrativeHints.slice(0,2).join(' | '));
+
+    const tag = (cfg.systemTag || 's').replace(/[<>]/g,'');
+    let systemBlock;
+    if (cfg.systemMode === 'minimal') {
+      const first = systemParts.length ? systemParts[0] : moodPart;
+      systemBlock = `<${tag}>${first}</${tag}>\n\n`;
+    } else if (cfg.systemMode === 'verbose') {
+      systemBlock = `<${tag}>\n${systemParts.join('\n')}\n</${tag}>\n\n`;
+    } else {
+      systemBlock = `<${tag}>${systemParts.join(' | ')}</${tag}>\n\n`;
+    }
+
+    // Trim systemBlock if it's huge
+    if (systemBlock.length > 800) systemBlock = systemBlock.slice(0,800) + '...<\/' + tag + '>\n\n';
+
+    // For compatibility with v3.1 and the host, ALWAYS return a string (not an array).
+    return systemBlock + (text || '');
+  } catch (e) {
+    console.error('YINGXUE_CONTEXT_SAFE failed:', e);
+    return text || '';
   }
+};
 
-  // Set flags from AI output keywords
-  if(YG_LIB.KEYMAP && YG_LIB.KEYMAP.flags){
-    for(const [flag, toks] of Object.entries(YG_LIB.KEYMAP.flags)){
-      for(const tok of toks){
-        if((aiText||"").toLowerCase().includes(tok.toLowerCase())){
-          YG_STATE.flags.storyFlags[flag] = true;
-          YG_STATE.dirty.flags = true;
-          C.addMemory({ text: `Flag from AI: ${flag}`, tier:"medium", tags:["flag"], kind:"flag", source:"ai" });
-          break;
+// Replace references (if your glue calls YINGXUE_CONTEXT directly, temporarily alias)
+globalThis.YINGXUE_CONTEXT_OLD = globalThis.YINGXUE_CONTEXT;
+globalThis.YINGXUE_CONTEXT = globalThis.YINGXUE_CONTEXT_SAFE;
+
+console.log('Patched YINGXUE_CONTEXT -> YINGXUE_CONTEXT_SAFE (string return, first-turn trimmed).');
+
+// YINGXUE — UI Story Card Publisher (Beautified)
+// Drops a neat, player-facing story-card that exposes live Yingxue config
+// Paste into your Library or run in console. Uses state.storyCards as host list.
+
+/*
+  Behavior:
+  - Detects and avoids overwriting Leah/Auto-Cards cards
+  - Updates an exact existing card when found
+  - Falls back to pushing a new card to state.storyCards
+  - Auto-generates a pretty entry from live config unless sc.entry exists
+  - Minimal, readable UI text — no triggers sent to the AI
+*/
+
+globalThis.YINGXUE_publishStoryCardUI = function(opts) {
+  opts = opts || {};
+  try {
+    state.yingxue = state.yingxue || {};
+    const cfg = state.yingxue.config || {};
+    const sc = state.yingxue.storyCard || state.storyCard || {};
+
+    const logger = function(...a) {
+      try { if (cfg && cfg.logToConsole) console.log('[YINGXUE]', ...a); } catch (e) {}
+    };
+
+    // Preset and identity
+    const preset = (sc.preset || 'Custom').toString();
+    const presetId = 'yx_settings_' + preset.replace(/\s+/g, '_').toLowerCase();
+    const title = `✦ Yingxue Engine Preset — ${preset} ✦`;
+
+    // keys: human-friendly trigger text (doesn't go to the AI — just UI label)
+    const keys = (sc.keys && String(sc.keys)) || 'Yingxue configuration card';
+
+    // Build a pretty, compact entry from live config unless a custom entry exists
+    const liveCfg = state.yingxue?.config || {};
+    const header = `✧ Yingxue v3.2c — Preset: ${preset}`;
+    const lines = [];
+    lines.push(header);
+    lines.push('');
+    lines.push(`Proactivity     ▸ ${liveCfg.proactivity?.level ?? 1}   (0=passive, 5=aggressive)`);
+    lines.push(`Author Notes    ▸ ${liveCfg.authorNotes?.mode ?? 'adaptive'}   (adaptive / off / full)`);
+    lines.push(`System Mode     ▸ ${liveCfg.systemMode ?? 'compact'}   (minimal / compact / verbose)`);
+    lines.push('');
+    lines.push(`Intimate Enh.  ▸ ${liveCfg.intimateEnhancers ? 'ON' : 'OFF'}`);
+    lines.push(`Momentum       ▸ ${liveCfg.emotionalMomentum ? 'ON' : 'OFF'}`);
+    lines.push(`Handle Modes   ▸ ${liveCfg.handleModes ? 'ON' : 'OFF'}`);
+    lines.push('');
+    lines.push(`Max Tension    ▸ ${liveCfg.tension?.maxTension ?? 10}`);
+    lines.push(`Engagement     ▸ ${liveCfg.engagement?.min ?? -3} → ${liveCfg.engagement?.max ?? 8}`);
+    lines.push('');
+    lines.push('✧ Tip: Edit values in Library and press save to apply changes.');
+    lines.push('✧ This card is player-facing only — it does not change what the AI receives.');
+
+    const prettyEntry = lines.join('\n');
+
+    // Allow a custom story-card entry to override (unless forceLive=true)
+    const entry = (sc.entry && !opts.forceLive) ? String(sc.entry).slice(0, 1000) : prettyEntry.slice(0, 1000);
+
+    // Story-card helper availability
+    const hasAdd = (typeof addStoryCard === 'function');
+    const hasUpdate = (typeof updateStoryCard === 'function');
+
+    state.storyCards = state.storyCards || [];
+
+    // ===== Detect Leah / Auto-Cards and avoid overwriting =====
+    let existingIndex = -1;
+    for (let i = 0; i < state.storyCards.length; i++) {
+      const c = state.storyCards[i];
+      if (!c) continue;
+
+      // Broad detection to avoid Leah / Auto-Cards interference
+      if (c.title === 'Configure Auto-Cards' ||
+          (c.keys && (String(c.keys).includes('Auto-Cards') || String(c.keys).includes('LewdLeah'))) ||
+          (c.entry && (String(c.entry).includes('Auto-Cards v') || String(c.entry).includes('LewdLeah') || String(c.entry).includes('Disable Auto-Cards')))) {
+        logger('Detected Leah/Auto-Cards config card at index', i, '— aborting to avoid overwrite.');
+        return false;
+      }
+
+      // Exact identity match
+      if (c.id === presetId && c.title === title && c.keys === keys) {
+        existingIndex = i;
+        break;
+      }
+    }
+
+    // Try to use host-provided APIs first (addStoryCard / updateStoryCard)
+    if (hasAdd) {
+      if (existingIndex >= 0 && hasUpdate) {
+        try {
+          updateStoryCard(existingIndex, keys, entry, 'config');
+          state.yingxue.storyCardPublished = true; // <<< ONE-TIME FLAG SET
+          logger('updateStoryCard OK index=', existingIndex);
+          return existingIndex;
+        } catch (e) {
+          logger('updateStoryCard failed, will attempt addStoryCard:', e && e.message);
+          existingIndex = -1; // fall through
         }
       }
+
+      try {
+        let idx = addStoryCard(keys, entry, 'config');
+        // Some hosts return idx, some return undefined/false for success — normalize
+        if (idx === false || idx == null || typeof idx === 'undefined') {
+          logger('addStoryCard returned dup/undef — falling back to push');
+          idx = -1;
+        }
+        if (idx >= 0) {
+          state.yingxue.storyCardPublished = true; // <<< ONE-TIME FLAG SET
+          logger('addStoryCard OK index=', idx);
+          return idx;
+        }
+      } catch (e) {
+        logger('addStoryCard failed, falling back to state.storyCards push:', e && e.message);
+      }
     }
-  }
 
-  // Increment fame and infamy counters from AI keywords
-  const fameScores = YG_LIB.scoreKeywordGroups(aiText, { fame: YG_LIB.KEYMAP.fame });
-  YG_STATE.fame += fameScores.fame || 0;
-  const infamyScores = YG_LIB.scoreKeywordGroups(aiText, { infamy: YG_LIB.KEYMAP.infamy });
-  YG_STATE.infamy += infamyScores.infamy || 0;
-  YG_STATE.dirty.fame = true;
-  YG_STATE.dirty.infamy = true;
+    // Fallback: update existing or push new
+    if (existingIndex >= 0) {
+      state.storyCards[existingIndex].entry = entry;
+      state.storyCards[existingIndex].keys = keys;
+      state.storyCards[existingIndex].title = title;
+      state.storyCards[existingIndex].type = 'config';
+      state.storyCards[existingIndex].id = presetId;
+      logger('state.storyCards updated (exact) at', existingIndex);
+      return existingIndex;
+    } else {
+      const cardObj = {
+        id: presetId,
+        keys: keys,
+        entry: entry,
+        type: 'config',
+        title: title,
+        description: 'Yingxue engine settings (player-facing)'
+      };
 
-  // Parse health changes from AI output
-  const damageMatch = aiText.match(/you (?:take|lose) (\d+) (?:damage|hp|health)/i);
-  if(damageMatch){
-    const dmg = parseInt(damageMatch[1], 10);
-    YG_STATE.playerHealth = Math.max(0, YG_STATE.playerHealth - dmg);
-    YG_STATE.dirty.playerHealth = true;
-    if(YG_STATE.playerHealth <= 0){
-      state.message = "You have died!";
-      YG_STATE.playerHealth = YG_STATE.maxHealth; // reset for now
+      state.storyCards.push(cardObj);
+      state.yingxue.storyCardPublished = true; // <<< ONE-TIME FLAG SET
+      // keep a tidy list
+      if (state.storyCards.length > 24) state.storyCards.shift();
+
+      logger('state.storyCards push OK (new) — index=', state.storyCards.length - 1);
+      return state.storyCards.length - 1;
     }
-    C.addMemory({ text: `Health change: -${dmg}`, tier: "short", tags:["health"] });
+
+  } catch (e) {
+    try { if (state && state.yingxue && state.yingxue.config && state.yingxue.config.logToConsole) console.warn('[YINGXUE] publish UI card failed', e && e.message); } catch (_) {}
+    return false;
   }
-  const healMatch = aiText.match(/you (?:gain|heal|recover) (\d+) (?:hp|health)/i);
-  if(healMatch){
-    const heal = parseInt(healMatch[1], 10);
-    YG_STATE.playerHealth = Math.min(YG_STATE.maxHealth, YG_STATE.playerHealth + heal);
-    YG_STATE.dirty.playerHealth = true;
-    C.addMemory({ text: `Health change: +${heal}`, tier: "short", tags:["health"] });
-  }
-
-  // Parse inventory gains from AI output (e.g., "you find sword")
-  const findMatch = aiText.match(/you (?:find|receive|obtain) (.+?)(?:\.|$)/i);
-  if(findMatch && YG_STATE.inventory.length < YG_LIB.CONFIG.INVENTORY_MAX){
-    const item = findMatch[1].trim();
-    if(!YG_STATE.inventory.includes(item)){
-      YG_STATE.inventory.push(item);
-      YG_STATE.dirty.inventory = true;
-      C.addMemory({ text: `Acquired item from AI: ${item}`, tier: "short", tags:["inventory"] });
-    }
-  }
-
-  // Parse relations from AI output (e.g., "X becomes your friend")
-  const friendMatch = aiText.match(/(\w+) becomes your (friend|ally|enemy)/i);
-  if(friendMatch){
-    const entName = friendMatch[1];
-    const type = friendMatch[2].toLowerCase();
-    const ent = YG_LIB.api.getEntityByNameOrAlias(entName);
-    if(ent){
-      YG_LIB.api.addRelation("player", ent.id, type); //  "player" assumed special id
-    }
-  }
-
-  // Append to narrative summary
-  YG_STATE.narrativeSummary = (YG_STATE.narrativeSummary || "") + `\nOutcome T${YG_STATE.turns}: ${YG_LIB.truncate(aiText,200)}`;
-  YG_STATE.dirty.narrativeSummary = true;
-
-  // Prune memories every 5 turns
-  if((YG_STATE.turns||0) % 5 === 0) C.pruneMemories();
-
-  // Update story card with AI outcome snippet
-  if(YG_LIB.CONFIG.AUTO_STORYCARD_ENABLED && YG_STATE.storyCard){
-    YG_STATE.storyCard.entry = (YG_STATE.storyCard.entry || "") + `\n[Update T${YG_STATE.turns}]: ${YG_LIB.truncate(aiText,120)}`;
-    YG_STATE.dirty.storyCard = true;
-  }
-
-  // Run output plugins/hooks
-  YG_LIB.runHook && YG_LIB.runHook("output", aiText);
-
-  return aiText;
-}
-
-// Output modifier entry point for AI text
-const modifier = (text, state, info, history, memory) => {
-  // LOAD PERSISTENCE
-  if(state && typeof state === "object"){
-    YG_STATE = state.yg || {};
-  }
-  YG_LIB.api.ensureState();
-
-  // Use info.actionCount for turns if provided
-  if(info && typeof info.actionCount === "number"){
-    YG_STATE.turns = info.actionCount;
-    YG_STATE.dirty.turns = true;
-  }
-
-  let processedText = text;
-  try{
-    processedText = processAIOutput(text || "");
-  } catch(e){
-    log(`Output process error: ${e.message}`, "error");
-  }
-
-  // SAVE PERSISTENCE
-  if(state && typeof state === "object"){
-    state.yg = YG_STATE;
-  }
-
-  return { text: processedText };
 };
+
+// Auto-run once if storyCard config is present (flag to prevent multi-run)
+try {
+  if (state && state.yingxue && state.yingxue.storyCard && !state.yingxue.storyCardPublished) {
+    YINGXUE_publishStoryCardUI();
+    state.yingxue.storyCardPublished = true; // One-time flag
+  }
+} catch (e) {}
+
+// End of YINGXUE UI Story Card Publisher
+// Robust auto-run installer (honors one-time flag)
+try {
+  state.yingxue = state.yingxue || {};
+  const sc = state.yingxue.storyCard || state.storyCard || {};
+  const preset = (sc.preset || 'Custom').toString();
+  const presetId = 'yx_settings_' + preset.replace(/\s+/g,'_').toLowerCase();
+
+  function cardExists() {
+    try { return Array.isArray(state.storyCards) && state.storyCards.some(c => c && c.id === presetId); }
+    catch (e) { return false; }
+  }
+
+  function attemptPublish() {
+    try {
+      if (state.yingxue.storyCardPublished && cardExists()) {
+        if (state.yingxue.config?.logToConsole) console.log('[YINGXUE] Story card already published.');
+        return true;
+      }
+      if (typeof YINGXUE_publishStoryCardUI !== 'function') {
+        if (state.yingxue.config?.logToConsole) console.warn('[YINGXUE] Publisher missing; cannot create story card.');
+        return false;
+      }
+      YINGXUE_publishStoryCardUI({ forceLive: true });
+      // publisher should set the flag on success; but we also check presence
+      if (cardExists()) {
+        state.yingxue.storyCardPublished = true;
+        if (state.yingxue.config?.logToConsole) console.log('[YINGXUE] Story card published (auto-run).');
+        return true;
+      }
+      return false;
+    } catch (e) {
+      if (state.yingxue.config?.logToConsole) console.warn('[YINGXUE] publish attempt error:', e && e.message);
+      return false;
+    }
+  }
+
+  // retries
+  let tries = 0, maxTries = 6, delayMs = 300;
+  (function loop(){
+    tries++;
+    if (state.yingxue.storyCardPublished) return;
+    const ok = attemptPublish();
+    if (ok) return;
+    if (tries >= maxTries) {
+      if (state.yingxue.config?.logToConsole) console.warn('[YINGXUE] Story card publish: giving up after', tries, 'tries.');
+      return;
+    }
+    setTimeout(loop, delayMs);
+  })();
+
+} catch (e) { /* noop */ }
