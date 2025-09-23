@@ -1,0 +1,32 @@
+const modifier = (text) => {
+    let stop = false;
+
+    // Core engine
+    if (typeof YINGXUE_CONTEXT === "function") {
+        try { text = YINGXUE_CONTEXT(text); } 
+        catch (e) { if (typeof safeLog === 'function') safeLog("Context Tab Error:", e && e.message); }
+    }
+
+    // Optional AutoCards integration (robust normalization)
+    if (typeof AutoCards === "function") {
+        try {
+            const res = AutoCards("context", text, stop);
+            if (globalThis.YINGXUE_helpers && typeof YINGXUE_helpers.normalizeAutoCards === 'function') {
+                const pair = YINGXUE_helpers.normalizeAutoCards(res, text, stop);
+                if (Array.isArray(pair) && pair.length >= 2) {
+                    text = pair[0];
+                    stop = pair[1];
+                } else if (typeof pair[0] === 'string') {
+                    text = pair[0];
+                }
+            } else if (Array.isArray(res) && res.length >= 2) {
+                [text, stop] = res;
+            } else if (typeof res === 'string') {
+                text = res;
+            }
+        } catch (e) { /* fail silently */ }
+    }
+
+    return { text, stop };
+};
+modifier(text);
