@@ -1,0 +1,2290 @@
+What do you think about this script for AI Dungeon?
+
+// YINGXUE v1.0 — Merged Framework (Patched: system tags, init order, name extraction, hint caps, compact memory, emotional momentum, enhancers, modes & actions resilience)
+// SUPER PATCH v2.0 INTEGRATED: Centralized constants, advanced perspective normalizer, tiered memory pruning, safe auto-hooking, performance monitoring, debug utilities, and test framework
+
+try { if (typeof state === 'undefined' || state === null) state = {}; } catch (e) { globalThis.state = globalThis.state || {}; }
+
+// ---------------- Core State (defaults) ---------------- 
+if (!state.yingxue) { 
+  state.yingxue = { 
+    config: { 
+      logToConsole: true, 
+      debug: false, 
+      systemMode: 'compact', // 'compact' | 'verbose' | 'minimal' 
+      systemTag: 's',       // use <s> ... </s> by default for AI Dungeon compatibility 
+      maxSystemHints: 6, 
+      maxSystemChars: 700, 
+      perspective: 'second', // 'first' | 'second' — toggle for pronoun normalization 
+      compactMode: true,     // reduces memory footprint when true 
+      intimateEnhancers: true, // enables sensory mood triggers 
+      emotionalMomentum: true, // enables momentum tracking 
+      handleModes: false, // NEW: allow mode handling (see/say/story)
+
+      attemptPatterns: {
+        intimate: '\\b(kiss|caress|touch|hold|embrace|stroke|nuzzle|cuddle|lean into|move closer)\\b',
+        emotional: '\\b(confess|admit|reveal|share|open up|trust|vulnerable|honest)\\b',
+        social: '\\b(persuade|convince|charm|flirt|seduce|tease|compliment|reassure)\\b',
+        assertive: '\\b(demand|insist|confront|challenge|push|force|grab|pull)\\b',
+        risky: '\\b(attack|fight|threaten|hurt|destroy|kill|strike|hit)\\b'
+      },
+
+      fillerWords: ['um', 'uh', 'er'], // Refined: Only pure stutters; removed 'like', 'just', etc. to avoid over-cleaning
+      tension: {
+        decayRate: 0.5,
+        buildRate: 1.5,
+        maxTension: 10,
+        minTension: -5,
+        decayEveryN: 2 // optional: apply decay every N turns; 0 means every turn
+      },
+
+      timeCycle: {
+        phases: ['Dawn', 'Morning', 'Noon', 'Afternoon', 'Evening', 'Night'],
+        ticksPerPhase: 4,
+        advanceOn: 'locationChange' // or 'input'
+      },
+
+      engagement: {
+        decayPerTurn: 1,
+        min: -3,
+        max: 8,
+        attemptBoost: 2,
+        passivePenalty: 1
+      },
+
+      proactivity: {
+        level: 1,
+        allowPhysical: false,
+        triggerThreshold: -2,
+        moodBursts: ['whispered confession', 'lingering gaze']
+      },
+
+      authorNotes: {
+        enabled: true,
+        mode: 'adaptive', // 'adaptive' | 'off'
+        maxLength: 200
+      }
+    },
+
+    // runtime
+    turn: 0,
+    currentLocation: null,
+    currentMood: 'neutral',
+    playerStatus: [],
+    engagement: 0,
+    timeIndex: 0,
+    lastActionType: null,
+    lastActionTypes: [],
+    lastInputDepth: 'basic',
+
+    lastSubtext: { detected: false, types: [], confidence: 0 },
+
+    characters: {},
+    relationshipTension: 0,
+    currentScene: {
+      primaryCharacter: null,
+      mood: 'neutral',
+      intimacyLevel: 0,
+      emotionalTension: 0
+    },
+
+    flags: {
+      locationChanged: false,
+      authorNoteSent: false,
+      _lastEnhancerTurn: -999,
+      isSeeMode: false,
+      lastPlayerAction: 'turn',
+      lastOutputText: '',
+      stateStack: [],
+      lastInputText: ''
+    },
+
+    metrics: {
+      totalTurns: 0,
+      authorNotesSent: 0,
+      locationChanges: 0
+    },
+
+    emotionalMomentum: { type: null, strength: 0, decay: 0.6 },
+    _initialized: false,
+    _cacheVersion: 0
+
+  }; 
+}
+
+// ---------------- Cache Rebuild (defined early) ---------------- 
+globalThis.YINGXUE_REBUILD_CACHE = function() { 
+  try { 
+    const cfg = state.yingxue?.config || {}; 
+    const patterns = cfg.attemptPatterns || {};
+
+    const compiledPatterns = {};
+    for (const [key, pattern] of Object.entries(patterns)) {
+      try {
+        compiledPatterns[key] = pattern ? new RegExp(pattern, 'i') : null;
+      } catch (e) {
+        compiledPatterns[key] = null;
+        if (cfg.debug) console.warn(`[YINGXUE] Invalid pattern for ${key}:`, e.message);
+      }
+    }
+
+    const fillerWords = cfg.fillerWords || [];
+    const fillerRegex = fillerWords.length ? new RegExp(`\\b(${fillerWords.join('|')})\\b`, 'gi') : null;
+
+    globalThis.YINGXUE_CACHE = {
+      patterns: compiledPatterns,
+      fillerRegex,
+      // fixed passiveInputs (single-line, includes unicode ellipsis alternative)
+      passiveInputs: /^(continue|wait|do nothing|keep going|what happens|sit and wait|(?:\.\.\.|[\u2026]))\s*[.!?]*$/i,
+      locationTriggers: {
+        input: /(?:go to|enter|travel to|arrive at|head to|move to)\s+(?:the|a|an)?\s*([\w\s'’\-#]+?)(?=\s*[.,!?;"']|$)/i,
+        output: /(?:arrive at|enter|find yourself in|reach|standing in|now in|step into)\s+(?:a|the)?\s*([\w\s'’\-#]+?)(?=\s*[.,!?;"']|$)/i
+      }
+    };
+
+    state.yingxue._cacheVersion = (state.yingxue._cacheVersion || 0) + 1;
+    if (cfg.logToConsole) console.log('[YINGXUE] Cache rebuilt, version:', state.yingxue._cacheVersion);
+    return true;
+
+  } catch (e) { 
+    console.error('[YINGXUE] Cache rebuild failed:', e); 
+    return false; 
+  } 
+};
+
+// ---------------- Subtext Detection ---------------- 
+const YX_SUBTEXT = { 
+  detectSubtext: function(text) { 
+    if (!text || typeof text !== 'string') return { detected: false, types: [], confidence: 0 }; 
+    const subtextTypes = []; 
+    const lower = text.toLowerCase();
+
+    const boundaryTests = [
+      /\b(just|only|simply)\s+(a|one|quick|small|little|brief)\b/i,
+      /\b(maybe|perhaps|possibly)\s+(we|you|i)\s+(could|should|might)\b/i,
+      /\b(what\s+if|suppose|imagine\s+if)\b/i
+    ];
+    const indirectRequests = [
+      /\b(i\s+wish|if\s+only|it\s+would\s+be\s+nice)\b/i,
+      /\b(some\s+people|someone|anyone)\s+(would|might|could)\b/i,
+      /\b(i\s+wonder|curious\s+about|makes\s+me\s+think)\b/i
+    ];
+    const seekingReassurance = [
+      /\b(probably\s+(boring|stupid|weird|wrong)|not\s+(interesting|important|worth))\b/i,
+      /\b(you\s+(must\s+think|probably|surely))\b/i,
+      /\b(sorry\s+(for|if|that)|hope\s+i'm\s+not)\b/i
+    ];
+    const plausibleDeniability = [
+      /\b(just\s+(friends|being\s+friendly|helping|curious))\b/i,
+      /\b(purely\s+(platonic|innocent|professional))\b/i,
+      /\b(for\s+(research|science|curiosity))\b/i
+    ];
+    const vulnerabilityTests = [
+      /\b(trust\s+me|between\s+(us|you\s+and\s+me)|our\s+secret)\b/i,
+      /\b(never\s+told\s+anyone|don't\s+usually)\b/i,
+      /\b(can\s+i\s+(tell|ask|trust)\s+you)\b/i
+    ];
+    const jealousyProbes = [
+      /\b(other\s+(people|guys|girls)|someone\s+else)\b/i,
+      /\b(popular|attractive|charming)\s+(with|to)\b/i,
+      /\b(i\s+bet|probably|must\s+have)\s+.*(lots\s+of|many|other)/i
+    ];
+
+    if (boundaryTests.some(r => r.test(text))) subtextTypes.push('boundary_testing');
+    if (indirectRequests.some(r => r.test(text))) subtextTypes.push('indirect_request');
+    if (seekingReassurance.some(r => r.test(text))) subtextTypes.push('seeking_reassurance');
+    if (plausibleDeniability.some(r => r.test(text))) subtextTypes.push('plausible_deniability');
+    if (vulnerabilityTests.some(r => r.test(text))) subtextTypes.push('vulnerability_test');
+    if (jealousyProbes.some(r => r.test(text))) subtextTypes.push('jealousy_probe');
+
+    // contradictions
+    const contradictionPatterns = [
+      /\b(not\s+that\s+i|don't\s+get\s+me\s+wrong|not\s+to\s+be)\b.*\bbut\b/i,
+      /\b(just|only|simply)\b.*\b(but|however|though)\b/i
+    ];
+    if (contradictionPatterns.some(r => r.test(text))) subtextTypes.push('contradiction');
+
+    // emotional inflation
+    const strongEmotions = /\b(amazing|incredible|perfect|wonderful|terrible|awful|devastating|overwhelming)\b/i;
+    const minorActions = /\b(look|glance|touch|sit|stand|walk|smile|nod|shrug)\b/i;
+    if (strongEmotions.test(text) && minorActions.test(text)) subtextTypes.push('emotional_inflation');
+
+    return {
+      detected: subtextTypes.length > 0,
+      types: subtextTypes,
+      confidence: Math.min(1, subtextTypes.length * 0.28)
+    };
+
+  },
+
+  generateSubtextGuidance: function(subtextData) { 
+    if (!subtextData || !subtextData.detected) return null; 
+    const map = { 
+      'boundary_testing': "Character should respond to the underlying test, not just the surface request.", 
+      'indirect_request': "Character may pick up on the hint or miss it entirely based on their personality and relationship level.", 
+      'seeking_reassurance': "Character can offer genuine reassurance, a gentle reality check, or miss the emotional need.", 
+      'plausible_deniability': "Character may see through the excuse or take it at face value.", 
+      'vulnerability_test': "Response reveals emotional availability and boundaries.", 
+      'jealousy_probe': "Character may address jealousy, be oblivious, or find it endearing/annoying.", 
+      'contradiction': "Character might notice contradiction and call it out, or focus on the true underlying feeling.", 
+      'emotional_inflation': "Character may respond to the stated emotion level or the actual situation based on their emotional intelligence." 
+    }; 
+    const primary = subtextData.types[0]; 
+    let text = map[primary] || 'Subtext detected - respond to both surface and underlying meanings.'; 
+    if (subtextData.types.length > 1) text += ' Multiple layers present - show layered response.'; 
+    return text; 
+  } 
+};
+
+// ---------------- Helpers & Small Utilities ---------------- 
+const YX_HELPERS = { 
+  log: function(...args) { 
+    if (state.yingxue?.config?.logToConsole) console.log('[YINGXUE]', ...args); 
+  },
+
+  // Improved name extractor: quoted names, "named/called", or robust TitleCase checks (ignores common sentence starters) 
+  extractCharacterName: function(text) { 
+    if (!text || typeof text !== 'string') return null; 
+    // 1) quoted... (unchanged)
+    const q = text.match(/"([A-Z][a-z]{1,}\b(?:\s[A-Z][a-z]{1,}\b)?)"/); 
+    if (q) return q[1];
+
+    // 2) named/called... (unchanged)
+    const named = text.match(/\b(?:named|called)\s+([A-Z][a-z]{1,}(?:\s[A-Z][a-z]{1,})?)/);
+    if (named) return named[1];
+
+    // 3) TitleCase: min 4 letters, skip generics/sentence-starts
+    const generics = new Set(['This','That','Here','There','It','One','All','Some','Many','Few']);
+    const stop = new Set(['The','A','An','And','But','Or','For','Nor','So','Yet','Then','When','While','If','Because','Is','Are','It','You','He','She','They','We']);
+    stop.add(...generics); // Merge generics into stop
+    const titleMatches = [...text.matchAll(/\b([A-Z][a-z]{3,})(?:\s([A-Z][a-z]{3,}))?\b/g)]; // Min 4 letters
+    for (const m of titleMatches) {
+      const candidate = (m[2] ? `${m[1]} ${m[2]}` : m[1]);
+      const firstWord = m[1];
+      if (candidate.length > 3 && !stop.has(firstWord) && !/^[.!?]\s+/.test(text.slice(0, text.indexOf(firstWord)))) { // Skip if likely sentence-start
+        return candidate;
+      }
+    }
+    return null;
+  },
+
+  // Multi-match action detector: returns array|string|null 
+  detectActionType: function(text) { 
+    if (!text || !globalThis.YINGXUE_CACHE) return null; 
+    const cache = globalThis.YINGXUE_CACHE; 
+    // Priority order (higher first) 
+    const order = ['risky', 'assertive', 'social', 'emotional', 'intimate']; 
+    const found = []; 
+    for (const k of order) { 
+      const r = cache.patterns[k]; 
+      if (r && r.test(text)) found.push(k); 
+    } 
+    if (found.length === 0) return null; 
+    if (found.length === 1) return found[0]; 
+    return found; // array of matches in priority order 
+  },
+
+  // NEW: Infer input mode heuristically (meta preferred when available) 
+  inferInputMode: function(text, meta) { 
+    if (meta && meta.inputMode) return meta.inputMode; 
+    if (globalThis.AIDungeon && globalThis.AIDungeon.inputMode) return globalThis.AIDungeon.inputMode; 
+    if (!text || typeof text !== 'string') return 'do'; 
+    const trimmed = text.trim(); 
+    if (trimmed.startsWith('You say, "') || (trimmed.startsWith('"') && trimmed.endsWith('"'))) return 'say'; 
+    if (trimmed.length > 120 && !/\b(I|you)\s+(do|say|go|take)\b/i.test(trimmed)) return 'story'; 
+    if (/\b(a|an|the)\s+(beautiful|fiery|dark|ancient|mysterious|old)\s+(dragon|castle|elf|scene|forest|landscape)\b/i.test(trimmed)) return 'see'; 
+    return 'do'; 
+  },
+
+  assessInputDepth: function(text) { 
+    if (!text) return 'empty'; 
+    const trimmed = text.trim(); 
+    if (trimmed.length < 5) return 'minimal'; 
+    const cache = globalThis.YINGXUE_CACHE; 
+    if (cache?.passiveInputs?.test(trimmed)) return 'passive'; 
+    const hasInternalThought = /\b(thinks|feels|wonders|realizes|notices|hopes)\b/i.test(text); 
+    const hasEmotionalWords = /\b(nervous|excited|worried|hopeful|curious|hesitant|vulnerable|attracted|conflicted)\b/i.test(text); 
+    const hasDetailedAction = text.length > 60 && /\b(gently|carefully|slowly|softly|deliberately|hesitantly|nervously|tenderly)\b/i.test(text); 
+    const hasDialogue = (text.match(/"/g) || []).length >= 2; 
+    const hasSub = YX_SUBTEXT.detectSubtext(text);
+
+    let depth = 'basic';
+    if (hasInternalThought || hasEmotionalWords) depth = 'thoughtful';
+    if (hasDetailedAction && (hasInternalThought || hasEmotionalWords)) depth = 'rich';
+    if (hasDialogue && hasInternalThought && text.length > 80) depth = 'immersive';
+    if (hasSub.detected) depth = depth === 'immersive' ? 'masterful' : 'nuanced';
+    return depth;
+
+  },
+
+  cleanFillers: function(text) { 
+    if (!text || typeof text !== 'string') return text; 
+    try { 
+      const c = globalThis.YINGXUE_CACHE; 
+      if (c?.fillerRegex) return text.replace(c.fillerRegex, '').replace(/\s{2,}/g, ' ').trim(); 
+    } catch (e) { 
+      YX_HELPERS.log('Filler cleaning failed:', e.message); 
+    } 
+    return text.replace(/\s{2,}/g, ' ').trim(); 
+  },
+
+  extractLocation: function(text, type = 'input') { 
+    if (!text || !globalThis.YINGXUE_CACHE) return null; 
+    try { 
+      const regex = globalThis.YINGXUE_CACHE.locationTriggers[type]; 
+      const match = regex?.exec(text); 
+      return match?.[1]?.trim() || null; 
+    } catch (e) { 
+      return null; 
+    } 
+  },
+
+  normalizePronouns: function(text) { 
+    if (!text || typeof text !== 'string') return text; 
+    const cfg = state.yingxue?.config || { perspective: 'second' }; 
+    const direction = cfg.perspective; 
+    try { 
+      // Extract and protect quoted sections 
+      const quoteMatches = text.match(/"([^"]*)"/g) || []; 
+      let protectedText = text; 
+      const placeholders = []; 
+      quoteMatches.forEach((match, idx) => { 
+        const placeholder = `__QUOTE_${idx}__`; 
+        placeholders[idx] = match; 
+        protectedText = protectedText.replace(match, placeholder); 
+      });
+
+      // Safer pronoun normalization: prefer lookbehind when available, otherwise anchored replace
+      if (direction === 'first') {
+        // 2nd → 1st: You → I, your → my, etc.
+        protectedText = protectedText
+          .replace(/\bYou are\b/gi, 'I am').replace(/\bYou're\b/gi, "I'm")
+          .replace(/\bYou were\b/gi, 'I was').replace(/\bYou have\b/gi, 'I have').replace(/\bYou've\b/gi, "I've")
+          .replace(/\bYou will\b/gi, 'I will').replace(/\bYou'll\b/gi, "I'll")
+          .replace(/\b(to|for|with|at|from)\s+you\b/gi, '$1 me')
+          .replace(/\bYour\s+/gi, 'My ');
+        // Sentence-initial You -> I (fallback safe anchor)
+        protectedText = protectedText.replace(/(^|[.!?]\s+)(You)\b/gi, (m, p1) => p1 + 'I');
+      } else {
+        // 'second' - 1st → 2nd
+        protectedText = protectedText
+          .replace(/\bI am\b/gi, 'you are').replace(/\bI'm\b/gi, "you're")
+          .replace(/\bI was\b/gi, 'you were')
+          .replace(/\bI have\b/gi, 'you have').replace(/\bI've\b/gi, "you've")
+          .replace(/\bI will\b/gi, 'you will').replace(/\bI'll\b/gi, "you'll")
+          .replace(/\b(to|for|with|at|from)\s+me\b/gi, '$1 you')
+          .replace(/\bMy\s+/gi, 'your ');
+        // Sentence-start I -> You with safer anchor
+        protectedText = protectedText.replace(/(^|[.!?]\s+)(I)\b/gi, (m, p1) => p1 + 'You');
+      }
+
+      // Restore quotes
+      placeholders.forEach((match, idx) => {
+        protectedText = protectedText.replace(`__QUOTE_${idx}__`, match);
+      });
+      return protectedText;
+    } catch (e) {
+      YX_HELPERS.log('Pronoun normalization failed:', e.message);
+      return text;
+    }
+  },
+
+  analyzeCharacterResponse: function(text) { 
+    if (!text) return 'neutral_interaction'; 
+    if (/(pulls?\s+away|steps?\s+back|rejects?|refuses?|says?\s+no|shakes?\s+head)/i.test(text)) return (state.yingxue.lastActionType || 'action') + '_rejected'; 
+    if (/(accepts?|agrees?|nods|smiles|leans?\s+in|moves?\s+closer|says?\s+yes)/i.test(text)) return (state.yingxue.lastActionType || 'action') + '_accepted'; 
+    if (/(angry|upset|annoyed|frustrated|glares?|frowns?)/i.test(text)) return 'conflict'; 
+    if (/(laughs?|giggles?|grins?|playful|teasing)/i.test(text)) return 'social_positive'; 
+    if (/(blushes?|nervous|shy|hesitant|uncertain)/i.test(text)) return 'emotional_shared'; 
+    return 'neutral_interaction'; 
+  },
+
+  syncState: function() {
+    // Quick sync: Propagate latest from input/output to global
+    const yx = state.yingxue;
+    if (yx.lastInputDepth && !yx.lastActionType) yx.lastActionType = 'character_action'; // Fallback
+    if (yx.currentLocation === 'null' || !yx.currentLocation) yx.currentLocation = 'an unknown place';
+    if (yx.engagement < 0) yx.engagement = 0; // Clamp low
+    yx.flags.lastInputMode = yx.flags.lastInputMode || 'do';
+    YX_HELPERS.log('State synced: turn=' + yx.turn + ', loc=' + yx.currentLocation + ', eng=' + yx.engagement);
+  }
+};
+
+// ---------------- Character Memory & Relationship (Patched Compact) ---------------- 
+const YX_CHARACTERS = { 
+  updateCharacterMemory: function(name, interaction, mood = null) { 
+    if (!name || !interaction) return; 
+    const cfg = state.yingxue.config; 
+    state.yingxue.characters = state.yingxue.characters || {}; 
+    const char = state.yingxue.characters[name] || { 
+      name, rel: 0,            // relationship (-5..5) 
+      int: 0,            // intimacy (0..5) 
+      last: 0,           // last seen turn 
+      mood: 'neutral', 
+      traits: [], 
+      history: [] 
+    };
+
+    // History: store compact entry (t=turn, type truncated)
+    char.history.push({ t: state.yingxue.turn, type: (interaction || '').substring(0, 12) });
+    const maxHist = cfg.compactMode ? 3 : 10;
+    if (char.history.length > maxHist) char.history = char.history.slice(-maxHist);
+
+    char.last = state.yingxue.turn;
+    char.mood = mood || state.yingxue.currentMood;
+
+    // Auto-trait from subtext (small bonus)
+    if (state.yingxue.lastSubtext?.detected) {
+      const traitRaw = state.yingxue.lastSubtext.types[0];
+      const trait = traitRaw ? traitRaw.replace(/_/g, '') : null;
+      if (trait && !char.traits.includes(trait)) {
+        char.traits.push(trait);
+        if (char.traits.length > 5) char.traits.shift();
+      }
+    }
+
+    // Adjust relationship using compact fields
+    this.adjustRelationship(char, interaction);
+
+    // Keep a tiny establishedMoods array (prune)
+    char.establishedMoods = char.establishedMoods || [];
+    if (char.establishedMoods.length === 0 || char.establishedMoods[char.establishedMoods.length - 1] !== char.mood) {
+      char.establishedMoods.push(char.mood);
+      if (char.establishedMoods.length > 5) char.establishedMoods = char.establishedMoods.slice(-5);
+    }
+
+    state.yingxue.characters[name] = char;
+    YX_HELPERS.log(`Memory update: ${name} (rel:${char.rel}, int:${char.int}, traits:${char.traits.join(',')})`);
+
+  },
+
+  adjustRelationship: function(char, interaction) { 
+    if (!char) return; 
+    // map compact interactions to adjustments 
+    const adjustments = { 
+      'intimate_accepted': { rel: +2, int: +1 }, 
+      'intimate_rejected': { rel: -1, int: 0 }, 
+      'emotional_shared': { rel: +1, int: +0.5 }, 
+      'social_positive': { rel: +1, int: 0 }, 
+      'social_negative': { rel: -1, int: 0 }, 
+      'assertive_accepted': { rel: 0, int: 0 }, 
+      'assertive_rejected': { rel: -2, int: -0.5 }, 
+      'conflict': { rel: -1, int: -0.5 } 
+    }; 
+    const adj = adjustments[interaction] || null; 
+    if (adj) { 
+      char.rel = Math.max(-5, Math.min(5, (char.rel || 0) + (adj.rel || 0))); 
+      char.int = Math.max(0, Math.min(5, (char.int || 0) + (adj.int || 0))); 
+    } 
+  },
+
+  getPrimaryCharacter: function() { 
+    if (!state.yingxue.characters) return null; 
+    const chars = Object.values(state.yingxue.characters); 
+    if (chars.length === 0) return null; 
+    return chars.sort((a, b) => (b.last || 0) - (a.last || 0))[0]; 
+  },
+
+  getRelationshipContext: function(name) { 
+    const char = state.yingxue.characters?.[name]; 
+    if (!char) return null; 
+    const relMap = { 
+      '-5': 'hostile', '-4': 'antagonistic', '-3': 'unfriendly', '-2': 'cool', '-1': 'distant', 
+      '0': 'neutral', '1': 'friendly', '2': 'warm', '3': 'close', '4': 'intimate', '5': 'deeply connected' 
+    }; 
+    const intLabels = { 
+      '0': 'strangers', '1': 'acquaintances', '2': 'friends', '3': 'close friends', '4': 'intimate', '5': 'deeply intimate' 
+    }; 
+    return { 
+      relationship: relMap[(char.rel || 0).toString()] || 'neutral', 
+      intimacy: intLabels[Math.floor(char.int || 0).toString()] || 'strangers', 
+      recentMoods: (char.establishedMoods || []).slice(-3), 
+      turnsSinceLastSeen: state.yingxue.turn - (char.last || 0) 
+    }; 
+  } 
+};
+
+// ---------------- Tension & Mood ---------------- 
+const YX_TENSION = { 
+  updateTension: function(actionTypeInput, inputDepth, subtextData) { 
+    const cfg = state.yingxue.config.tension; 
+    let tensionDelta = 0; 
+    const tensionMap = { 
+      'intimate': +2, 'emotional': +1.5, 'social': +1, 'assertive': +1, 'risky': +3 
+    };
+
+    // accept array or single type
+    const types = Array.isArray(actionTypeInput) ? actionTypeInput : (actionTypeInput ? [actionTypeInput] : []);
+    let base = 0;
+    for (const t of types) base += (tensionMap[t] || 0);
+    tensionDelta = base * cfg.buildRate;
+
+    const depthMultiplier = { 'minimal': 0.5, 'basic': 1, 'thoughtful': 1.2, 'rich': 1.5, 'immersive': 2, 'masterful': 2.5, 'nuanced': 1.8 };
+    tensionDelta *= (depthMultiplier[inputDepth] || 1);
+
+    if (subtextData && subtextData.detected) tensionDelta += subtextData.confidence * 2;
+
+    // decay only on certain turns if configured
+    let decay = cfg.decayRate || 0;
+    if (typeof cfg.decayEveryN === 'number' && cfg.decayEveryN > 0) {
+      decay = (state.yingxue.turn % cfg.decayEveryN === 0) ? cfg.decayRate : 0;
+    }
+
+    state.yingxue.relationshipTension = Math.max(cfg.minTension, Math.min(cfg.maxTension, state.yingxue.relationshipTension - decay + tensionDelta));
+    state.yingxue.currentScene.emotionalTension = Math.round(state.yingxue.relationshipTension / 3);
+
+  },
+
+  getMoodContagion: function(characterMood, playerAction) { 
+    const map = { 
+      'happy': { 'intimate': 'excited', 'emotional': 'warm', 'social': 'pleased' }, 
+      'sad': { 'intimate': 'vulnerable', 'emotional': 'melancholy', 'social': 'withdrawn' }, 
+      'angry': { 'intimate': 'conflicted', 'emotional': 'intense', 'social': 'sharp' }, 
+      'nervous': { 'intimate': 'flustered', 'emotional': 'anxious', 'social': 'cautious' }, 
+      'playful': { 'intimate': 'teasing', 'emotional': 'light', 'social': 'engaging' } 
+    }; 
+    return map[characterMood]?.[playerAction] || characterMood; 
+  } 
+};
+
+// ---------------- Emotional Momentum ---------------- 
+const YX_MOMENTUM = { 
+  update: function(actionType, responseType) { 
+    const momentum = state.yingxue.emotionalMomentum || { type: null, strength: 0, decay: 0.6 }; 
+    const cfg = state.yingxue.config; 
+    if (!cfg.emotionalMomentum) return; // Gated
+
+    const momentumMap = {
+      'intimate_accepted': { type: 'romantic_buildup', strength: 2 },
+      'intimate_rejected': { type: 'romantic_tension', strength: 1.5 },
+      'conflict': { type: 'dramatic_tension', strength: 2 },
+      'emotional_shared': { type: 'emotional_bonding', strength: 1.5 },
+      'jealousy_probe_accepted': { type: 'obsessive_spiral', strength: 2.5 }
+    };
+
+    const key = responseType || (actionType ? `${actionType}_neutral` : null);
+    const newMomentum = momentumMap[responseType] || momentumMap[key];
+
+    if (newMomentum) {
+      if (momentum.type === newMomentum.type) {
+        momentum.strength = Math.min(5, (momentum.strength || 0) + newMomentum.strength * 0.7);
+      } else {
+        momentum.type = newMomentum.type;
+        momentum.strength = newMomentum.strength;
+      }
+    } else {
+      momentum.strength = Math.max(0, (momentum.strength || 0) - (momentum.decay || 0.6));
+      if (momentum.strength < 0.5) {
+        momentum.type = null;
+        momentum.strength = 0;
+      }
+    }
+    state.yingxue.emotionalMomentum = momentum;
+    YX_HELPERS.log(`Momentum: ${momentum.type} (${(momentum.strength||0).toFixed(1)})`);
+
+  } 
+};
+
+// ---------------- Time ---------------- 
+const YX_TIME = { 
+  advance: function(steps = 1) { 
+    try { 
+      const cfg = state.yingxue.config.timeCycle; 
+      state.yingxue.timeIndex = Math.max(0, (state.yingxue.timeIndex || 0) + steps); 
+      const totalPhases = cfg.phases.length; 
+      const totalTicks = totalPhases * cfg.ticksPerPhase; 
+      const tick = state.yingxue.timeIndex % totalTicks; 
+      const phaseIndex = Math.floor(tick / cfg.ticksPerPhase); 
+      const newPhase = cfg.phases[phaseIndex] || 'Unknown'; 
+      const moods = { 
+        'Dawn': 'hopeful', 'Morning': 'energetic', 'Noon': 'active', 'Afternoon': 'focused', 'Evening': 'calm', 'Night': 'mysterious' 
+      }; 
+      if (moods[newPhase] && !state.yingxue.playerStatus.includes('injured')) state.yingxue.currentMood = moods[newPhase]; 
+      YX_HELPERS.log('Time advanced to', newPhase); 
+    } catch (e) { 
+      YX_HELPERS.log('Time advance failed:', e.message); 
+    } 
+  },
+
+  getCurrentPhase: function() { 
+    try { 
+      const cfg = state.yingxue.config.timeCycle; 
+      const totalPhases = cfg.phases.length; 
+      const totalTicks = totalPhases * cfg.ticksPerPhase; 
+      const day = Math.floor(state.yingxue.timeIndex / totalTicks) + 1; 
+      const tickInDay = state.yingxue.timeIndex % totalTicks; 
+      const phaseIndex = Math.floor(tickInDay / cfg.ticksPerPhase); 
+      const phase = cfg.phases[phaseIndex] || 'Unknown'; 
+      return { day, phase, tick: (tickInDay % cfg.ticksPerPhase) + 1 }; 
+    } catch (e) { 
+      return { day: 1, phase: 'Unknown', tick: 1 }; 
+    } 
+  } 
+};
+
+// ---------------- Author Notes (Enhanced) ---------------- 
+const YX_AUTHOR_NOTES = { 
+  send: function(note, force = false) { 
+    try { 
+      const cfg = state.yingxue.config.authorNotes; 
+      if (!cfg.enabled && !force) return false; 
+      if (!note || typeof note !== 'string') return false; 
+      const cleanNote = note.slice(0, cfg.maxLength).trim(); 
+      if (!cleanNote) return false; 
+      state.memory = state.memory || {}; 
+      state.memory.authorsNote = cleanNote; 
+      state.yingxue.flags.authorNoteSent = true; 
+      state.yingxue.flags._lastAuthorNoteTurn = state.yingxue.turn;
+      state.yingxue.metrics.authorNotesSent++; 
+      YX_HELPERS.log('Author note:', cleanNote); 
+      return true; 
+    } catch (e) { 
+      YX_HELPERS.log('Author note failed:', e.message); 
+      return false; 
+    } 
+  },
+
+  clear: function() { 
+    try { 
+      if (state.memory?.authorsNote) delete state.memory.authorsNote; 
+      state.yingxue.flags.authorNoteSent = false; 
+    } catch (e) { 
+      YX_HELPERS.log('Author note clear failed:', e.message); 
+    } 
+  },
+
+  generateContextual: function(actionType, engagement, inputDepth) { 
+    const cfg = state.yingxue.config.authorNotes || { enabled: true, mode: 'adaptive', maxLength: 200 }; 
+    if (cfg.mode === 'off') return null; 
+    let note = null;
+
+    switch (actionType) {
+      case 'intimate': note = 'Intimate action attempted. Focus on emotional reactions and body language.'; break;
+      case 'emotional': note = 'Emotional vulnerability shown. React genuinely based on personality.'; break;
+      case 'social': note = 'Social interaction—let personality guide reaction.'; break;
+      case 'assertive': note = 'Assertive action—show immediate reaction, no auto-compliance.'; break;
+      case 'risky': note = 'Dangerous action—describe consequences and resistance.'; break;
+    }
+
+    if (inputDepth === 'rich' || inputDepth === 'immersive') note = (note || '') + ' Match the detailed tone of the input.';
+
+    // Low-engagement initiative
+    if (engagement <= (state.yingxue.config.proactivity?.triggerThreshold ?? -2) && !note) {
+      note = 'Low engagement: character should take meaningful initiative.';
+    }
+
+    // Append subtext guidance (safe append)
+    if (state.yingxue.lastSubtext?.detected) {
+      const sub = YX_SUBTEXT.generateSubtextGuidance(state.yingxue.lastSubtext);
+      if (sub) note = note ? (note + ' ' + sub) : sub;
+    }
+
+    // Sensory / intimacy enhancers (keep very short) with cooldown
+    try {
+      const turnSince = state.yingxue.turn - (state.yingxue.flags._lastEnhancerTurn || -999);
+      if (state.yingxue.config.intimateEnhancers && state.yingxue.currentScene?.intimacyLevel >= 3 && ['intimate','emotional'].includes(actionType) && turnSince > 2) {
+        const moods = {
+          'neutral': 'a soft glow of candlelight',
+          'nervous': "a quickening pulse in the quiet",
+          'playful': "a teasing breeze at the window",
+          'hopeful': "a warm hush in the room",
+          'mysterious': "shadows leaning in at the corners"
+        };
+        const enhancer = moods[state.yingxue.currentMood] || 'an intimate hush';
+        note = (note || '') + ` Mood enhancer: ${enhancer}.`;
+        state.yingxue.flags._lastEnhancerTurn = state.yingxue.turn;
+      }
+    } catch (e) {
+      YX_HELPERS.log('Enhancer attach failed:', e.message);
+    }
+
+    // Add emotional momentum context
+    const momentum = state.yingxue.emotionalMomentum;
+    if (momentum && momentum.type && momentum.strength > 2) {
+      const momentumNotes = {
+        'romantic_buildup': 'Building romantic tension—escalate naturally or create meaningful pause.',
+        'romantic_tension': 'Romantic conflict present—address underlying feelings.',
+        'dramatic_tension': 'High drama—characters should react emotionally, not logically.',
+        'emotional_bonding': 'Emotional connection building—deepen intimacy through vulnerability.',
+        'obsessive_spiral': 'Obsession rising—hint at darker impulses without breaking immersion.'
+      };
+      if (momentumNotes[momentum.type]) {
+        note = note ? `${note} ${momentumNotes[momentum.type]}` : momentumNotes[momentum.type];
+      }
+    }
+
+    // Add scene pacing hints
+    if (state.yingxue.turn > 5 && !actionType) {
+      note = note ? `${note} Consider scene transition or character initiative.` : 'Scene may need progression or character-driven action.';
+    }
+
+    // Add perspective guidance when in first-person mode
+    if (state.yingxue.config.perspective === 'first') {
+      note = (note || '') + ' Respond in first-person narration, revealing inner thoughts.';
+    }
+
+    if (!note) return null;
+    return note.slice(0, cfg.maxLength).trim();
+
+  } 
+};
+
+// ---------------- Narrative Hinting ---------------- 
+const YX_NARRATIVE = { 
+  generateHints: function(actionType, engagement, inputDepth, subtextData) { 
+    const hints = []; 
+    const cfg = state.yingxue.config; 
+    switch (actionType) { 
+      case 'intimate': hints.push('NARR: Intimate attempt - focus on emotions'); break; 
+      case 'emotional': hints.push('NARR: Vulnerability - respond based on personality'); break; 
+      case 'social': hints.push('NARR: Social interaction - authentic response'); break; 
+      case 'assertive': hints.push('NARR: Assertive - show resistance or compliance'); break; 
+      case 'risky': hints.push('NARR: Risky - realistic consequences'); break; 
+      default: if (inputDepth === 'thoughtful' || inputDepth === 'rich') hints.push('NARR: Detailed input - match nuance'); 
+    } 
+    if (subtextData && subtextData.detected) { 
+      for (const t of subtextData.types) { 
+        hints.push(`SUBTEXT: ${t.replace(/_/g, ' ')}`); 
+      } 
+    } 
+    if (inputDepth === 'immersive' || inputDepth === 'masterful') hints.push('PACING: High input depth - respond with equal sophistication'); 
+    const tension = state.yingxue.relationshipTension; 
+    if (tension > 7) hints.push('TENSION: Very high - charged atmosphere'); 
+    else if (tension > 4) hints.push('TENSION: Elevated - undercurrents present'); 
+    else if (tension < -2) hints.push('TENSION: Low - relaxed dynamic'); 
+    if (engagement >= state.yingxue.config.engagement.max - 1) hints.push('PACING: High engagement - sustain intensity'); 
+    else if (engagement <= state.yingxue.config.engagement.min + 1) hints.push('PACING: Low engagement - character initiative encouraged'); 
+    const primary = YX_CHARACTERS.getPrimaryCharacter(); 
+    if (primary && primary.history.length > 3) hints.push('MEMORY: Reference previous interactions for consistency'); 
+    // intimate descriptor enhancer 
+    try { 
+      if (cfg.intimateEnhancers && actionType === 'intimate' && state.yingxue.currentScene?.intimacyLevel >= 3) { 
+        const desc = (state.yingxue.relationshipTension > 4) ? 'charged with unspoken desire' : 'tender and exploratory'; 
+        hints.push(`INTIMACY: ${desc}`); 
+      } 
+    } catch (e) { /* noop */ } 
+    return hints; 
+  } 
+};
+
+// ---------------- Engagement Update (single authority) ---------------- 
+const YX_ENGAGEMENT = { 
+  updateFromInput: function(cleanText, originalText) { 
+    const cfg = state.yingxue.config.engagement; 
+    const inputDepth = YX_HELPERS.assessInputDepth(cleanText); 
+    const at = YX_HELPERS.detectActionType(cleanText); 
+    const actionType = Array.isArray(at) ? at[0] : at;
+
+    if (cfg.decayPerTurn > 0) {
+      if (state.yingxue.engagement > 0) state.yingxue.engagement = Math.max(0, state.yingxue.engagement - cfg.decayPerTurn);
+      else if (state.yingxue.engagement < 0) state.yingxue.engagement = Math.min(0, state.yingxue.engagement + cfg.decayPerTurn);
+    }
+
+    const depthBonus = { 'empty': -2, 'minimal': -1, 'passive': 0, 'basic': 1, 'thoughtful': 2, 'rich': 3, 'immersive': 4, 'masterful': 5, 'nuanced': 4 };
+    const bonus = depthBonus[inputDepth] || 1;
+    state.yingxue.engagement += bonus;
+
+    // boost if any emotional/intimate present in multi-detect
+    if (at) {
+      const types = Array.isArray(at) ? at : [at];
+      if (types.some(t => ['intimate', 'emotional'].includes(t))) {
+        state.yingxue.engagement += 1;
+      }
+    }
+
+    const hasDebuff = state.yingxue.playerStatus.some(s => ['injured', 'exhausted', 'bleeding', 'poisoned'].includes(s));
+    if (hasDebuff) state.yingxue.engagement -= 1;
+
+    state.yingxue.engagement = Math.max(cfg.min, Math.min(cfg.max, state.yingxue.engagement));
+    state.yingxue.lastInputDepth = inputDepth;
+
+  } 
+};
+
+// ---------------- Snapshot helpers for rollbacks ---------------- 
+globalThis.YINGXUE_PUSH_STATE = function() { 
+  try { 
+    state.yingxue.stateStack = state.yingxue.stateStack || []; 
+    const snap = { 
+      turn: state.yingxue.turn, 
+      engagement: state.yingxue.engagement, 
+      relationshipTension: state.yingxue.relationshipTension, 
+      emotionalMomentum: JSON.parse(JSON.stringify(state.yingxue.emotionalMomentum || {type:null,strength:0,decay:0.6})), 
+      currentMood: state.yingxue.currentMood, 
+      characters: state.yingxue.config.compactMode ? null : JSON.parse(JSON.stringify(state.yingxue.characters || {})) 
+    }; 
+    state.yingxue.stateStack.push(snap); 
+    if (state.yingxue.stateStack.length > 6) state.yingxue.stateStack.shift(); 
+    return true; 
+  } catch (e) { 
+    YX_HELPERS.log('Push state failed:', e.message); 
+    return false; 
+  } 
+};
+
+globalThis.YINGXUE_RESTORE_LAST = function() { 
+  try { 
+    state.yingxue.stateStack = state.yingxue.stateStack || []; 
+    const snap = state.yingxue.stateStack.pop(); 
+    if (!snap) { 
+      console.log('[YINGXUE] No state snapshot to restore'); 
+      return false; 
+    } 
+    state.yingxue.turn = snap.turn; 
+    state.yingxue.engagement = snap.engagement; 
+    state.yingxue.relationshipTension = snap.relationshipTension; 
+    state.yingxue.emotionalMomentum = snap.emotionalMomentum; 
+    state.yingxue.currentMood = snap.currentMood; 
+    if (snap.characters) state.yingxue.characters = snap.characters; 
+    console.log('[YINGXUE] Restored previous state snapshot'); 
+    return true; 
+  } catch (e) { 
+    console.error('[YINGXUE] Restore failed:', e); 
+    return false; 
+  } 
+};
+
+// ---------------- Main Handlers (mode-aware) ---------------- 
+globalThis.YINGXUE_INPUT = function(text, meta) { 
+  try { 
+    // ensure cache early 
+    if (!globalThis.YINGXUE_CACHE) YINGXUE_REBUILD_CACHE(); 
+    const cfg = state.yingxue.config || {}; 
+    const originalText = text || '';
+
+    // infer input mode before changing turn counts
+    const inputMode = cfg.handleModes ? YX_HELPERS.inferInputMode(originalText, meta) : 'do';
+    state.yingxue.flags.lastInputMode = inputMode;
+
+    if (cfg.handleModes && inputMode === 'see') {
+      state.yingxue.flags.isSeeMode = true;
+      // Light-clean and tag for Context but do not count as a full narrative turn
+      return `[Visual Prompt] ${YX_HELPERS.cleanFillers(originalText)}`;
+    }
+if (cfg.handleModes && inputMode === 'story') {
+  // narrative insertion — gentle updates to evolve state without full inflation
+  state.yingxue.lastActionType = 'narrative_shift';
+  state.yingxue.relationshipTension *= 0.85;
+  YX_TENSION.updateTension(null, 'rich', null); // Assume richer depth for story
+
+  // Light state refresh: extract & update location/mood/subtext
+  const storySubtext = YX_SUBTEXT.detectSubtext(originalText);
+  state.yingxue.lastSubtext = storySubtext;
+  if (storySubtext.detected) {
+    // Derive mood from subtext (e.g., playful → 'playful')
+    const inferredMood = storySubtext.types.includes('emotional_inflation') ? 'playful' : 'neutral';
+    state.yingxue.currentMood = inferredMood;
+  }
+
+  const storyLocation = YX_HELPERS.extractLocation(originalText, 'input');
+  if (storyLocation && storyLocation !== state.yingxue.currentLocation) {
+    state.yingxue.currentLocation = storyLocation;
+    state.yingxue.flags.locationChanged = true;
+    state.yingxue.metrics.locationChanges++;
+    YX_HELPERS.log('Story location updated to:', storyLocation);
+  }
+
+  // Fractional turn/time advance (0.5) to evolve without full tick
+  state.yingxue.turn += 0.5;
+  state.yingxue.metrics.totalTurns += 0.5;
+  YX_TIME.advance(0.5); // Partial phase shift
+
+  // Push light snapshot
+  if (typeof YINGXUE_PUSH_STATE_MIN === 'function') YINGXUE_PUSH_STATE_MIN();
+
+  // Add narrative hint to author note
+  const narrativeNote = YX_AUTHOR_NOTES.generateContextual('narrative_shift', state.yingxue.engagement, 'rich');
+  if (narrativeNote) YX_AUTHOR_NOTES.send(narrativeNote);
+
+  return originalText; // Still passthrough
+}
+
+    // default behavior (do / say) — now increment turn
+    state.yingxue.turn++; state.yingxue.metrics.totalTurns++;
+    state.yingxue.flags.locationChanged = false; state.yingxue.flags.authorNoteSent = false;
+
+    let cleaned = YX_HELPERS.normalizePronouns(originalText);
+    cleaned = YX_HELPERS.cleanFillers(cleaned);
+
+    // Engagement & detection (single source)
+    YX_ENGAGEMENT.updateFromInput(cleaned, originalText);
+    const actionDetected = YX_HELPERS.detectActionType(cleaned); // string | array | null
+
+    // store lastActionTypes for richer decisions
+    state.yingxue.lastActionTypes = Array.isArray(actionDetected) ? actionDetected : (actionDetected ? [actionDetected] : []);
+    const primaryAction = state.yingxue.lastActionTypes[0] || null;
+    state.yingxue.lastActionType = primaryAction || 'character_action';
+
+    const inputDepth = state.yingxue.lastInputDepth;
+    const subtextData = YX_SUBTEXT.detectSubtext(originalText);
+
+    state.yingxue.lastSubtext = subtextData;
+
+    // tension uses the full array where possible
+    YX_TENSION.updateTension(state.yingxue.lastActionTypes, inputDepth, subtextData);
+
+    const charName = YX_HELPERS.extractCharacterName(originalText);
+    if (charName) {
+      YX_CHARACTERS.updateCharacterMemory(charName, (primaryAction || 'action') + '_attempted');
+      state.yingxue.currentScene.primaryCharacter = charName;
+    }
+
+const newLocation = YX_HELPERS.extractLocation(originalText, 'input');
+if (newLocation && newLocation !== state.yingxue.currentLocation) {
+  state.yingxue.currentLocation = newLocation;
+  state.yingxue.flags.locationChanged = true;
+  state.yingxue.metrics.locationChanges++;
+  YX_HELPERS.log('Location changed to:', newLocation);
+} else if (state.yingxue.currentLocation === "null") {
+  state.yingxue.currentLocation = 'an unknown place'; // Reset stale mod artifact
+  YX_HELPERS.log('Location reset to default (cleaned stale "null")');
+}
+
+    const timeCfg = state.yingxue.config.timeCycle;
+    if (timeCfg.advanceOn === 'input') YX_TIME.advance(1);
+
+    let needsPrefix = (state.yingxue.lastInputDepth === 'minimal' || state.yingxue.lastInputDepth === 'basic');
+    const inferredMode = inputMode || 'do';
+    if (inferredMode === 'say' && needsPrefix) {
+      needsPrefix = false;
+    } else if (needsPrefix && cleaned.trim().length > 5) cleaned = '[Action] ' + cleaned;
+
+    state.yingxue.flags.lastInputText = originalText; // Persist for CONTEXT
+
+    YX_HELPERS.log('Input processed. Mode:', inferredMode, 'Action:', state.yingxue.lastActionType, 'Depth:', state.yingxue.lastInputDepth, 'Tension:', state.yingxue.relationshipTension);
+    if (subtextData.detected) YX_HELPERS.log('Subtext:', subtextData.types.join(', '), 'Confidence:', subtextData.confidence);
+    return cleaned;
+
+  } catch (e) { 
+    YX_HELPERS.log('INPUT processing failed:', e.message); 
+    return text || ''; 
+  } 
+};
+
+// Return shape [text, stop] — compatible with AutoCards and your context modifier 
+globalThis.YINGXUE_CONTEXT = function(text, stop) { 
+  try { 
+    if (!globalThis.YINGXUE_CACHE) YINGXUE_REBUILD_CACHE(); 
+    YX_HELPERS.syncState(); // Sync pre-build
+    const timeInfo = YX_TIME.getCurrentPhase(); 
+    const cfg = state.yingxue.config; 
+    const systemParts = []; 
+
+    const timeStr = `Time: ${timeInfo.phase} (Day ${timeInfo.day})`; 
+    const moodStr = `Mood: ${state.yingxue.currentMood}`; 
+
+    // Always include time + mood
+    systemParts.push(`${timeStr} | ${moodStr}`);
+
+    // Only include location if one is actually set, with fallback heuristic if vague
+    let effectiveLoc = state.yingxue.currentLocation;
+    if (!effectiveLoc || effectiveLoc === 'an unknown place' || effectiveLoc === 'null') {
+      // Quick heuristic: infer from text or lastOutputText
+      effectiveLoc = YX_HELPERS.extractLocation(text, 'output') || 
+                     YX_HELPERS.extractLocation(state.yingxue.flags.lastOutputText || '', 'output') || 
+                     'a familiar setting'; // Ultra-safe default
+      state.yingxue.currentLocation = effectiveLoc; // Persist for next
+      YX_HELPERS.log('Context loc fallback:', effectiveLoc);
+    }
+    
+    if (effectiveLoc) {
+      const locStr = `Location: ${effectiveLoc}`;
+      systemParts.unshift(locStr); // Front-load for priority
+    }
+
+    if (state.yingxue.playerStatus.length > 0) {
+      systemParts.push(`Status: ${state.yingxue.playerStatus.join(', ')}`);
+    }
+
+
+    // Mode tag for Context
+    if (cfg.handleModes && state.yingxue.flags.isSeeMode) {
+      systemParts.push('Mode: SEE - Describe image evocatively');
+    }
+
+    const narrativeHints = YX_NARRATIVE.generateHints(
+      state.yingxue.lastActionType,
+      state.yingxue.engagement,
+      state.yingxue.lastInputDepth,
+      state.yingxue.lastSubtext
+    );
+
+    // Merge hints (limit them to avoid bloat)
+    let hints = Array.isArray(narrativeHints) ? narrativeHints.slice(0, cfg.maxSystemHints) : [];
+    // Include relationship context if primary char exists
+    const primary = YX_CHARACTERS.getPrimaryCharacter();
+    if (primary) {
+      const relCtx = YX_CHARACTERS.getRelationshipContext(primary.name);
+      if (relCtx) hints.unshift(`Character: ${primary.name} (${relCtx.relationship}, ${relCtx.intimacy})`);
+    }
+
+    // Combine system parts + hints
+    const allParts = [...systemParts, ...hints];
+    // Build system block using configured tag
+    const tag = (cfg.systemTag || 's').replace(/[<>]/g, '');
+    let systemBlock;
+    if (cfg.systemMode === 'minimal') systemBlock = `<${tag}>${allParts[0]}</${tag}>\n\n`;
+    else if (cfg.systemMode === 'verbose') systemBlock = `<${tag}>\n${allParts.join('\n')}\n</${tag}>\n\n`;
+    else systemBlock = `<${tag}>${allParts.join(' | ')}</${tag}>\n\n`;
+
+    // Cap size — trim trailing parts if needed
+    if (systemBlock.length > cfg.maxSystemChars) {
+      const limited = allParts.slice(0, cfg.maxSystemHints).join(' | ');
+      systemBlock = `<${tag}>${limited}</${tag}>\n\n`;
+    }
+
+    // Author note generation (trimmed)
+    const originalText = state.yingxue.flags.lastInputText || text;
+    const authorNote = YX_AUTHOR_NOTES.generateContextual(
+      state.yingxue.lastActionType,
+      state.yingxue.engagement,
+      state.yingxue.lastInputDepth
+    );
+    if (authorNote) YX_AUTHOR_NOTES.send(authorNote);
+
+    return [systemBlock + text, stop];
+
+  } catch (e) { 
+    YX_HELPERS.log('CONTEXT processing failed:', e.message); 
+    return [text, stop]; 
+  } 
+};
+
+// OUTPUT core 
+globalThis.YINGXUE_OUTPUT = function(text, meta) { 
+  try { 
+    const prevText = state.yingxue.flags.lastOutputText; 
+    const playerAction = (meta && meta.playerAction) || (globalThis.AIDungeon && globalThis.AIDungeon.currentAction) || state.yingxue.flags.lastPlayerAction || 'turn'; 
+    state.yingxue.flags.lastPlayerAction = playerAction;
+
+    // Handle erase -> rollback
+    if (playerAction === 'erase') {
+      if (state.yingxue.stateStack && state.yingxue.stateStack.length > 0) {
+        const priorState = state.yingxue.stateStack.pop();
+        state.yingxue.emotionalMomentum = priorState.emotionalMomentum || { type: null, strength: 0 };
+        state.yingxue.relationshipTension = priorState.relationshipTension || 0;
+        state.yingxue.turn = priorState.turn || Math.max(0, state.yingxue.turn - 1);
+      } else {
+        state.yingxue.turn = Math.max(0, state.yingxue.turn - 1);
+        state.yingxue.relationshipTension *= 0.9;
+      }
+      YX_AUTHOR_NOTES.clear();
+      YX_HELPERS.log('Erase rollback applied');
+      return text;
+    }
+
+    // Retry gating: skip double updates if identical
+    if (playerAction === 'retry' && text === prevText) {
+      YX_HELPERS.log('Retry detected: skipping duplicate update');
+      return text;
+    }
+
+    // Continue: passive update
+    if (playerAction === 'continue') {
+      try { YX_ENGAGEMENT.updateFromInput('continue', ''); } catch (e) {}
+      state.yingxue.lastInputDepth = 'passive';
+      state.yingxue.lastActionType = 'extend_scene';
+      try { YX_TENSION.updateTension(['social'], 'basic', null); } catch (e) {}
+      // count continue as a turn if desired — here we advance to keep pacing consistent
+      state.yingxue.turn++;
+      YX_HELPERS.log('Continue: Pseudo-update applied');
+    }
+
+    // Clean out any [Action] artifacts
+    text = (text || '').replace(/\[Action\]\s*/g, '');
+
+    const newLocation = YX_HELPERS.extractLocation(text, 'output');
+    if (newLocation && newLocation !== state.yingxue.currentLocation) {
+      state.yingxue.currentLocation = newLocation;
+      state.yingxue.flags.locationChanged = true;
+      state.yingxue.metrics.locationChanges++;
+      YX_HELPERS.log('Location detected in output:', newLocation);
+    }
+
+    const timeCfg = state.yingxue.config.timeCycle;
+    if (timeCfg.advanceOn === 'locationChange' && state.yingxue.flags.locationChanged) YX_TIME.advance(1);
+
+    if (!state.yingxue.config.debug) {
+      const tag = (state.yingxue.config.systemTag || 's').replace(/[<>]/g, '');
+      const re = new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>\\n*`, 'g');
+      text = text.replace(re, '');
+    }
+
+    // Push to stack for potential erases (limit depth)
+    if (playerAction === 'turn' || playerAction === 'continue') {
+      state.yingxue.turn++; // Force advance for 'turn' (missing before)
+      state.yingxue.metrics.totalTurns++;
+      state.yingxue.stateStack.push({
+        emotionalMomentum: JSON.parse(JSON.stringify(state.yingxue.emotionalMomentum || {type:null,strength:0,decay:0.6})),
+        relationshipTension: state.yingxue.relationshipTension,
+        turn: state.yingxue.turn
+      });
+      if (state.yingxue.stateStack.length > 6) state.yingxue.stateStack.shift();
+    }
+
+    // Update memory from response (gated for retry)
+    if (!(playerAction === 'retry' && text === prevText)) {
+      const primary = YX_CHARACTERS.getPrimaryCharacter();
+      if (primary) {
+        const responseType = YX_HELPERS.analyzeCharacterResponse(text);
+        YX_CHARACTERS.updateCharacterMemory(primary.name, responseType);
+        const mood = YX_TENSION.getMoodContagion(state.yingxue.currentMood, state.yingxue.lastActionType);
+        if (mood !== state.yingxue.currentMood) {
+          state.yingxue.currentMood = mood;
+          YX_HELPERS.log('Mood contagion applied:', mood);
+        }
+
+        // Update emotional momentum
+        YX_MOMENTUM.update(state.yingxue.lastActionType, responseType);
+      }
+    }
+
+    // cleanup
+    YX_AUTHOR_NOTES.clear();
+    state.yingxue.lastActionType = null;
+    state.yingxue.lastActionTypes = [];
+    state.yingxue.flags.locationChanged = false;
+    state.yingxue.flags.isSeeMode = false;
+    state.yingxue.flags.lastOutputText = text;
+
+    YX_HELPERS.log('Output done. Engagement:', state.yingxue.engagement, 'Tension:', state.yingxue.relationshipTension, 'Action:', playerAction);
+    return text;
+
+  } catch (e) { 
+    YX_HELPERS.log('OUTPUT processing failed:', e.message); 
+    return text; 
+  } 
+};
+
+// ---------------- API / Utilities ---------------- 
+globalThis.YINGXUE_INIT = function() { 
+  try { 
+    YX_HELPERS.log('Initializing YINGXUE...'); 
+    YINGXUE_REBUILD_CACHE(); 
+    state.yingxue._initialized = true; 
+    const timeInfo = YX_TIME.getCurrentPhase(); 
+    YX_HELPERS.log(`Initialized. Time: ${timeInfo.phase} (Day ${timeInfo.day})`); 
+    return true; 
+  } catch (e) { 
+    console.error('[YINGXUE] Init failed:', e); 
+    return false; 
+  } 
+};
+
+if (!state.yingxue._initialized) YINGXUE_INIT();
+
+globalThis.YINGXUE_STATUS = function() { 
+  const yx = state.yingxue; 
+  const timeInfo = YX_TIME.getCurrentPhase(); 
+  console.log('=== YINGXUE STATUS ==='); 
+  console.log('Turn:', yx.turn); 
+  console.log(`Time: ${timeInfo.phase} (Day ${timeInfo.day}, Tick ${timeInfo.tick})`); 
+  console.log('Location:', yx.currentLocation || '— not set —');
+  console.log('Mood:', yx.currentMood); 
+  console.log(`Engagement: ${yx.engagement} (${yx.config.engagement.min}..${yx.config.engagement.max})`); 
+  console.log('Player Status:', yx.playerStatus.join(', ') || 'None'); 
+  console.log('Last Action Type:', yx.lastActionType || 'None'); 
+  console.log('Last Player Action:', yx.flags.lastPlayerAction || 'None'); 
+  console.log('Relationship Tension:', yx.relationshipTension); 
+  console.log('Metrics:', yx.metrics); 
+  console.log('Cache Version:', yx._cacheVersion); 
+  console.log('Primary Character:', YX_CHARACTERS.getPrimaryCharacter()?.name || 'None'); 
+  const mom = yx.emotionalMomentum; 
+  console.log(`Momentum: ${mom.type || 'none'} (${mom.strength.toFixed(1)})`); 
+  console.log('----------------------'); 
+};
+
+// small compatibility helpers (optional) 
+globalThis.YINGXUE_RESET = function() { 
+  try { 
+    delete state.yingxue; 
+    YX_HELPERS.log('State cleared; reinitializing...'); 
+    YINGXUE_INIT(); 
+    return true; 
+  } catch (e) { 
+    return false; 
+  } 
+};
+
+globalThis.YINGXUE_TOGGLE_FIRST_PERSON = function() { 
+  state.yingxue.config.perspective = state.yingxue.config.perspective === 'first' ? 'second' : 'first'; 
+  console.log(`Perspective: ${state.yingxue.config.perspective}-person mode ON`); 
+};
+
+globalThis.YINGXUE_TOGGLE_COMPACT = function() { 
+  state.yingxue.config.compactMode = !state.yingxue.config.compactMode; 
+  console.log('Compact mode:', state.yingxue.config.compactMode ? 'ON (lean & mean)' : 'OFF (full history)'); 
+};
+
+globalThis.YINGXUE_QUICK_STATUS = function() { 
+  const yx = state.yingxue; 
+  const mom = yx.emotionalMomentum; 
+  console.log(`Turn ${yx.turn} | Mood: ${yx.currentMood} | Eng: ${yx.engagement} | Ten: ${yx.relationshipTension} | Mom: ${mom.type || 'none'} (${mom.strength.toFixed(1)})`); 
+  console.log('Location:', yx.currentLocation); 
+  const primary = YX_CHARACTERS.getPrimaryCharacter(); 
+  if (primary) console.log(`${primary.name}: rel ${primary.rel || 0}, int ${primary.int || 0}, traits: ${primary.traits.join(', ')}`); 
+};
+
+YX_HELPERS.log('YINGXUE v1.0 patched loaded (multi-detect, safer pronouns, enhancer cooldown, modes & actions resilience)');
+
+// ---------- Ephemeral / Prune Patch (drop-in) ----------
+(function(){
+  if (!state) state = {};
+  state.yingxue = state.yingxue || {};
+  state.yingxue.config = state.yingxue.config || {};
+  // defaults (change these)
+  state.yingxue.config.memoryRetentionTurns = state.yingxue.config.memoryRetentionTurns ?? 3; // keep 3 turns of char history by default
+  state.yingxue.config.snapshotLimit = state.yingxue.config.snapshotLimit ?? 3; // small snapshots
+  state.yingxue.config.pruneThresholdChars = state.yingxue.config.pruneThresholdChars ?? 50000; // if state string > this, aggressive prune
+  state.yingxue.flags = state.yingxue.flags || {};
+
+  // small signature generator for output dedupe (cheap)
+  YX_HELPERS.outputSig = function(text) {
+    if (!text) return '';
+    const slice = text.slice(0, 200);
+    // cheap checksum: sum of char codes modulo large number
+    let s = 0;
+    for (let i = 0; i < slice.length; i++) s = (s*31 + slice.charCodeAt(i)) % 1000000007;
+    return `${slice.length}:${s}`;
+  };
+
+  // Minimal snapshot push / restore (store only essential fields)
+  globalThis.YINGXUE_PUSH_STATE_MIN = function() {
+    try {
+      state.yingxue.stateStack = state.yingxue.stateStack || [];
+      const snap = {
+        t: state.yingxue.turn,
+        eng: state.yingxue.engagement,
+        ten: state.yingxue.relationshipTension,
+        mom: state.yingxue.emotionalMomentum ? {...state.yingxue.emotionalMomentum} : {type:null,strength:0},
+        mood: state.yingxue.currentMood,
+        loc: state.yingxue.currentLocation,
+        primary: state.yingxue.currentScene?.primaryCharacter || null
+      };
+      state.yingxue.stateStack.push(snap);
+      if (state.yingxue.stateStack.length > (state.yingxue.config.snapshotLimit || 3)) state.yingxue.stateStack.shift();
+      return true;
+    } catch (e) {
+      YX_HELPERS.log('push_min failed:', e.message);
+      return false;
+    }
+  };
+
+  globalThis.YINGXUE_RESTORE_LAST_MIN = function() {
+    try {
+      state.yingxue.stateStack = state.yingxue.stateStack || [];
+      const snap = state.yingxue.stateStack.pop();
+      if (!snap) return false;
+      state.yingxue.turn = snap.t ?? state.yingxue.turn;
+      state.yingxue.engagement = snap.eng ?? state.yingxue.engagement;
+      state.yingxue.relationshipTension = snap.ten ?? state.yingxue.relationshipTension;
+      state.yingxue.emotionalMomentum = snap.mom ?? state.yingxue.emotionalMomentum;
+      state.yingxue.currentMood = snap.mood ?? state.yingxue.currentMood;
+      state.yingxue.currentLocation = snap.loc ?? state.yingxue.currentLocation;
+      state.yingxue.currentScene = state.yingxue.currentScene || {};
+      state.yingxue.currentScene.primaryCharacter = snap.primary ?? state.yingxue.currentScene.primaryCharacter;
+      return true;
+    } catch (e) {
+      YX_HELPERS.log('restore_min failed:', e.message);
+      return false;
+    }
+  };
+
+  // pruneState: removes stale characters, trims history, decays ephemeral fields
+  YX_HELPERS.pruneState = function(forceAggressive) {
+    try {
+      const cfg = state.yingxue.config;
+      const retain = Math.max(1, cfg.memoryRetentionTurns || 3);
+      const now = state.yingxue.turn || 0;
+
+      // Characters: drop or trim
+      const chars = state.yingxue.characters || {};
+      const keep = {};
+      for (const [name, c] of Object.entries(chars)) {
+        // prune if unseen for > retain turns AND no meaningful relationship/intimacy
+        const unseen = (now - (c.last || 0)) > retain;
+        const hasBond = (c.rel && Math.abs(c.rel) > 0) || (c.int && c.int > 0);
+        if (!unseen || hasBond) {
+          // trim history to last `retain` entries (or 3)
+          if (Array.isArray(c.history)) {
+            const maxHist = Math.max(1, retain);
+            c.history = c.history.slice(-maxHist);
+          }
+          // prune traits to small set
+          if (Array.isArray(c.traits) && c.traits.length > 5) c.traits = c.traits.slice(-5);
+          keep[name] = c;
+        } else {
+          // dropped — optional debug
+          YX_HELPERS.log(`Pruned character: ${name}`);
+        }
+      }
+      state.yingxue.characters = keep;
+
+      // momentum: decay small strengths to zero
+      if (state.yingxue.emotionalMomentum) {
+        if ((state.yingxue.emotionalMomentum.strength || 0) < 0.5) {
+          state.yingxue.emotionalMomentum.type = null;
+          state.yingxue.emotionalMomentum.strength = 0;
+        }
+      }
+
+      // author notes & enhancer flags: make ephemeral
+      if (state.yingxue.flags && state.yingxue.flags._lastEnhancerTurn) {
+        if ((now - state.yingxue.flags._lastEnhancerTurn) > retain) {
+          delete state.yingxue.flags._lastEnhancerTurn;
+        }
+      }
+      if (state.memory?.authorsNote) {
+        const noteTurn = state.yingxue.flags._lastAuthorNoteTurn || state.yingxue.turn;
+        if ((now - noteTurn) > retain) {
+          delete state.memory.authorsNote;
+          state.yingxue.flags.authorNoteSent = false;
+        }
+      }
+
+      // aggressive fallback if state string is huge or forced
+      const stateSize = JSON.stringify(state.yingxue || {}).length;
+      if (forceAggressive || stateSize > (cfg.pruneThresholdChars || 50000)) {
+        // remove all but primary character, compress histories
+        const primary = YX_CHARACTERS.getPrimaryCharacter();
+        const newChars = {};
+        if (primary) {
+          const p = state.yingxue.characters[primary.name];
+          if (p) {
+            p.history = p.history ? p.history.slice(-1) : [];
+            p.traits = p.traits ? p.traits.slice(-3) : [];
+            newChars[primary.name] = p;
+          }
+        }
+        state.yingxue.characters = newChars;
+        // reduce stack
+        state.yingxue.stateStack = (state.yingxue.stateStack || []).slice(-1);
+        // drop large fields
+        state.yingxue._cacheVersion = state.yingxue._cacheVersion || 0;
+        YX_HELPERS.log('Aggressive prune applied; new size approx', JSON.stringify(state.yingxue).length);
+      }
+      return true;
+    } catch (e) {
+      YX_HELPERS.log('Prune failed:', e.message);
+      return false;
+    }
+  };
+
+  // Integrate prune into the output flow: call at end of YINGXUE_OUTPUT (if present)
+  // We will patch/wrap if YINGXUE_OUTPUT_CORE exists as in your patched library.
+  if (typeof globalThis.YINGXUE_OUTPUT === 'function' && !globalThis.YINGXUE_OUTPUT_PRUNE_WRAPPED) {
+    globalThis.YINGXUE_OUTPUT_PRUNE_WRAPPED = true;
+    const core = globalThis.YINGXUE_OUTPUT;
+    globalThis.YINGXUE_OUTPUT = function(text, meta) {
+      try {
+        // cheap dedupe: if same signature as previous, skip memory update (core should already gate)
+        const sig = YX_HELPERS.outputSig(text);
+        if (sig && sig === state.yingxue.flags._lastOutputSig) {
+          // call core but do not double-update complex memory (core should already gate)
+          const out = core(text, meta);
+          // still prune lightly (no force)
+          YX_HELPERS.pruneState(false);
+          return out;
+        }
+        // push a minimal snapshot before we mutate
+        YINGXUE_PUSH_STATE_MIN();
+        const out = core(text, meta);
+        // store last signature
+        state.yingxue.flags._lastOutputSig = sig;
+        // prune after output (normal prune)
+        YX_HELPERS.pruneState(false);
+
+        // optional: if state gets very large, run aggressive prune
+        const size = JSON.stringify(state.yingxue || {}).length;
+        if (size > (state.yingxue.config.pruneThresholdChars || 50000)) {
+          YX_HELPERS.pruneState(true);
+        }
+        return out;
+      } catch (e) {
+        YX_HELPERS.log('OUTPUT prune wrapper failed:', e.message);
+        try { return core(text, meta); } catch (ee) { return text; }
+      }
+    };
+  }
+
+  // expose a manual prune function
+  globalThis.YINGXUE_PRUNE_NOW = function(aggressive) {
+    return YX_HELPERS.pruneState(!!aggressive);
+  };
+
+  YX_HELPERS.log('Ephemeral-prune patch loaded (retentionTurns=' + (state.yingxue.config.memoryRetentionTurns||3) + ')');
+})();
+// === Compatibility wrapper for YINGXUE_CONTEXT (coerce to string, avoid heavy injection on first turn)
+globalThis.YINGXUE_CONTEXT_SAFE = function(text, stop) {
+  try {
+    // ensure cache and sync
+    if (!globalThis.YINGXUE_CACHE) YINGXUE_REBUILD_CACHE();
+    if (typeof YX_HELPERS !== 'undefined' && YX_HELPERS.syncState) YX_HELPERS.syncState();
+
+    const cfg = state.yingxue?.config || {};
+    // Build the systemParts similarly to your v3.2c but guarded & trimmed
+    const timeInfo = (typeof YX_TIME !== 'undefined' && YX_TIME.getCurrentPhase) ? YX_TIME.getCurrentPhase() : {day:1, phase:''};
+    const moodPart = `Mood: ${state.yingxue.currentMood || ''}`;
+    let systemParts = [];
+
+    // Only include time/location if explicitly allowed AND not the very first prompt
+    const initialPrompt = ((state.yingxue.metrics?.totalTurns || 0) === 0 || state.yingxue.turn <= 1);
+    if (!initialPrompt && cfg.enableTime) {
+      systemParts.push(`Time: ${timeInfo.phase} (Day ${timeInfo.day})`);
+    }
+    if (!initialPrompt && cfg.enableLocation && state.yingxue.currentLocation) {
+      systemParts.push(`Location: ${state.yingxue.currentLocation}`);
+    }
+    // Always include mood (safe, short)
+    systemParts.push(moodPart);
+
+    // Add status and a few narrative hints but keep it tiny
+    if (state.yingxue.playerStatus?.length) systemParts.push(`Status: ${state.yingxue.playerStatus.join(', ')}`);
+    const narrativeHints = (typeof YX_NARRATIVE !== 'undefined') ? YX_NARRATIVE.generateHints(state.yingxue.lastActionType, state.yingxue.engagement, state.yingxue.lastInputDepth) : [];
+    // take at most 2 hints to avoid bloat
+    if (Array.isArray(narrativeHints) && narrativeHints.length) systemParts.push(narrativeHints.slice(0,2).join(' | '));
+
+    const tag = (cfg.systemTag || 's').replace(/[<>]/g,'');
+    let systemBlock;
+    if (cfg.systemMode === 'minimal') {
+      const first = systemParts.length ? systemParts[0] : moodPart;
+      systemBlock = `<${tag}>${first}</${tag}>\n\n`;
+    } else if (cfg.systemMode === 'verbose') {
+      systemBlock = `<${tag}>\n${systemParts.join('\n')}\n</${tag}>\n\n`;
+    } else {
+      systemBlock = `<${tag}>${systemParts.join(' | ')}</${tag}>\n\n`;
+    }
+
+    // Trim systemBlock if it's huge
+    if (systemBlock.length > 800) systemBlock = systemBlock.slice(0,800) + '...<\/' + tag + '>\n\n';
+
+    // For compatibility with v3.1 and the host, ALWAYS return a string (not an array).
+    return systemBlock + (text || '');
+  } catch (e) {
+    console.error('YINGXUE_CONTEXT_SAFE failed:', e);
+    return text || '';
+  }
+};
+
+// Replace references (if your glue calls YINGXUE_CONTEXT directly, temporarily alias)
+globalThis.YINGXUE_CONTEXT_OLD = globalThis.YINGXUE_CONTEXT;
+globalThis.YINGXUE_CONTEXT = globalThis.YINGXUE_CONTEXT_SAFE;
+
+console.log('Patched YINGXUE_CONTEXT -> YINGXUE_CONTEXT_SAFE (string return, first-turn trimmed).');
+
+// YINGXUE — UI Story Card Publisher (Beautified)
+// Drops a neat, player-facing story-card that exposes live Yingxue config
+// Paste into your Library or run in console. Uses state.storyCards as host list.
+
+/*
+  Behavior:
+  - Detects and avoids overwriting Leah/Auto-Cards cards
+  - Updates an exact existing card when found
+  - Falls back to pushing a new card to state.storyCards
+  - Auto-generates a pretty entry from live config unless sc.entry exists
+  - Minimal, readable UI text — no triggers sent to the AI
+*/
+
+globalThis.YINGXUE_publishStoryCardUI = function(opts) {
+  opts = opts || {};
+  try {
+    state.yingxue = state.yingxue || {};
+    const cfg = state.yingxue.config || {};
+    const sc = state.yingxue.storyCard || state.storyCard || {};
+
+    const logger = function(...a) {
+      try { if (cfg && cfg.logToConsole) console.log('[YINGXUE]', ...a); } catch (e) {}
+    };
+
+    // Preset and identity
+    const preset = (sc.preset || 'Custom').toString();
+    const presetId = 'yx_settings_' + preset.replace(/\s+/g, '_').toLowerCase();
+    const title = `✦ Yingxue Engine Preset — ${preset} ✦`;
+
+    // keys: human-friendly trigger text (doesn't go to the AI — just UI label)
+    const keys = (sc.keys && String(sc.keys)) || 'Yingxue configuration card';
+
+    // Build a pretty, compact entry from live config unless a custom entry exists
+    const liveCfg = state.yingxue?.config || {};
+    const header = `✧ Yingxue v3.2c — Preset: ${preset}`;
+    const lines = [];
+    lines.push(header);
+    lines.push('');
+    lines.push(`Proactivity     ▸ ${liveCfg.proactivity?.level ?? 1}   (0=passive, 5=aggressive)`);
+    lines.push(`Author Notes    ▸ ${liveCfg.authorNotes?.mode ?? 'adaptive'}   (adaptive / off / full)`);
+    lines.push(`System Mode     ▸ ${liveCfg.systemMode ?? 'compact'}   (minimal / compact / verbose)`);
+    lines.push('');
+    lines.push(`Intimate Enh.  ▸ ${liveCfg.intimateEnhancers ? 'ON' : 'OFF'}`);
+    lines.push(`Momentum       ▸ ${liveCfg.emotionalMomentum ? 'ON' : 'OFF'}`);
+    lines.push(`Handle Modes   ▸ ${liveCfg.handleModes ? 'ON' : 'OFF'}`);
+    lines.push('');
+    lines.push(`Max Tension    ▸ ${liveCfg.tension?.maxTension ?? 10}`);
+    lines.push(`Engagement     ▸ ${liveCfg.engagement?.min ?? -3} → ${liveCfg.engagement?.max ?? 8}`);
+    lines.push('');
+    lines.push('✧ Tip: Edit values in Library and press save to apply changes.');
+    lines.push('✧ This card is player-facing only — it does not change what the AI receives.');
+
+    const prettyEntry = lines.join('\n');
+
+    // Allow a custom story-card entry to override (unless forceLive=true)
+    const entry = (sc.entry && !opts.forceLive) ? String(sc.entry).slice(0, 1000) : prettyEntry.slice(0, 1000);
+
+    // Story-card helper availability
+    const hasAdd = (typeof addStoryCard === 'function');
+    const hasUpdate = (typeof updateStoryCard === 'function');
+
+    state.storyCards = state.storyCards || [];
+
+    // ===== Detect Leah / Auto-Cards and avoid overwriting =====
+    let existingIndex = -1;
+    for (let i = 0; i < state.storyCards.length; i++) {
+      const c = state.storyCards[i];
+      if (!c) continue;
+
+      // Broad detection to avoid Leah / Auto-Cards interference
+      if (c.title === 'Configure Auto-Cards' ||
+          (c.keys && (String(c.keys).includes('Auto-Cards') || String(c.keys).includes('LewdLeah'))) ||
+          (c.entry && (String(c.entry).includes('Auto-Cards v') || String(c.entry).includes('LewdLeah') || String(c.entry).includes('Disable Auto-Cards')))) {
+        logger('Detected Leah/Auto-Cards config card at index', i, '— aborting to avoid overwrite.');
+        return false;
+      }
+
+      // Exact identity match
+      if (c.id === presetId && c.title === title && c.keys === keys) {
+        existingIndex = i;
+        break;
+      }
+    }
+
+    // Try to use host-provided APIs first (addStoryCard / updateStoryCard)
+    if (hasAdd) {
+      if (existingIndex >= 0 && hasUpdate) {
+        try {
+          updateStoryCard(existingIndex, keys, entry, 'config');
+          state.yingxue.storyCardPublished = true; // <<< ONE-TIME FLAG SET
+          logger('updateStoryCard OK index=', existingIndex);
+          return existingIndex;
+        } catch (e) {
+          logger('updateStoryCard failed, will attempt addStoryCard:', e && e.message);
+          existingIndex = -1; // fall through
+        }
+      }
+
+      try {
+        let idx = addStoryCard(keys, entry, 'config');
+        // Some hosts return idx, some return undefined/false for success — normalize
+        if (idx === false || idx == null || typeof idx === 'undefined') {
+          logger('addStoryCard returned dup/undef — falling back to push');
+          idx = -1;
+        }
+        if (idx >= 0) {
+          state.yingxue.storyCardPublished = true; // <<< ONE-TIME FLAG SET
+          logger('addStoryCard OK index=', idx);
+          return idx;
+        }
+      } catch (e) {
+        logger('addStoryCard failed, falling back to state.storyCards push:', e && e.message);
+      }
+    }
+
+    // Fallback: update existing or push new
+    if (existingIndex >= 0) {
+      state.storyCards[existingIndex].entry = entry;
+      state.storyCards[existingIndex].keys = keys;
+      state.storyCards[existingIndex].title = title;
+      state.storyCards[existingIndex].type = 'config';
+      state.storyCards[existingIndex].id = presetId;
+      logger('state.storyCards updated (exact) at', existingIndex);
+      return existingIndex;
+    } else {
+      const cardObj = {
+        id: presetId,
+        keys: keys,
+        entry: entry,
+        type: 'config',
+        title: title,
+        description: 'Yingxue engine settings (player-facing)'
+      };
+
+      state.storyCards.push(cardObj);
+      state.yingxue.storyCardPublished = true; // <<< ONE-TIME FLAG SET
+      // keep a tidy list
+      if (state.storyCards.length > 24) state.storyCards.shift();
+
+      logger('state.storyCards push OK (new) — index=', state.storyCards.length - 1);
+      return state.storyCards.length - 1;
+    }
+
+  } catch (e) {
+    try { if (state && state.yingxue && state.yingxue.config && state.yingxue.config.logToConsole) console.warn('[YINGXUE] publish UI card failed', e && e.message); } catch (_) {}
+    return false;
+  }
+};
+
+// Auto-run once if storyCard config is present (flag to prevent multi-run)
+try {
+  if (state && state.yingxue && state.yingxue.storyCard && !state.yingxue.storyCardPublished) {
+    YINGXUE_publishStoryCardUI();
+    state.yingxue.storyCardPublished = true; // One-time flag
+  }
+} catch (e) {}
+
+// End of YINGXUE UI Story Card Publisher
+// Robust auto-run installer (honors one-time flag)
+try {
+  state.yingxue = state.yingxue || {};
+  const sc = state.yingxue.storyCard || state.storyCard || {};
+  const preset = (sc.preset || 'Custom').toString();
+  const presetId = 'yx_settings_' + preset.replace(/\s+/g,'_').toLowerCase();
+
+  function cardExists() {
+    try { return Array.isArray(state.storyCards) && state.storyCards.some(c => c && c.id === presetId); }
+    catch (e) { return false; }
+  }
+
+  function attemptPublish() {
+    try {
+      if (state.yingxue.storyCardPublished && cardExists()) {
+        if (state.yingxue.config?.logToConsole) console.log('[YINGXUE] Story card already published.');
+        return true;
+      }
+      if (typeof YINGXUE_publishStoryCardUI !== 'function') {
+        if (state.yingxue.config?.logToConsole) console.warn('[YINGXUE] Publisher missing; cannot create story card.');
+        return false;
+      }
+      YINGXUE_publishStoryCardUI({ forceLive: true });
+      // publisher should set the flag on success; but we also check presence
+      if (cardExists()) {
+        state.yingxue.storyCardPublished = true;
+        if (state.yingxue.config?.logToConsole) console.log('[YINGXUE] Story card published (auto-run).');
+        return true;
+      }
+      return false;
+    } catch (e) {
+      if (state.yingxue.config?.logToConsole) console.warn('[YINGXUE] publish attempt error:', e && e.message);
+      return false;
+    }
+  }
+
+  // retries
+  let tries = 0, maxTries = 6, delayMs = 300;
+  (function loop(){
+    tries++;
+    if (state.yingxue.storyCardPublished) return;
+    const ok = attemptPublish();
+    if (ok) return;
+    if (tries >= maxTries) {
+      if (state.yingxue.config?.logToConsole) console.warn('[YINGXUE] Story card publish: giving up after', tries, 'tries.');
+      return;
+    }
+    setTimeout(loop, delayMs);
+  })();
+
+} catch (e) { /* noop */ }
+
+/* =====================================================================================
+   YINGXUE SUPER PATCH v2.0 — Production-Ready Enhancement Suite (INTEGRATED)
+   
+   FEATURES:
+   ✓ Centralized constants with story card override support
+   ✓ Robust perspective normalizer with quote protection (overrides base normalizePronouns)
+   ✓ Tiered memory pruning system with anchor/core/ephemeral levels (enhances base pruning)
+   ✓ Safe auto-hooking with revert capability
+   ✓ Performance monitoring and error recovery
+   ✓ Debug utilities and testing framework
+   
+   INSTALLATION:
+   1. This is now merged—load as single file
+   2. Call YINGXUE_SUPER_PATCH_INIT() with your story card config
+   3. Optional: Run YINGXUE_TEST_SUPER_PATCH() to verify functionality
+   
+   STORY CARD INTEGRATION:
+   Add to your story card's world info or document:
+   ```
+   YINGXUE_PATCH_CONFIG = {
+     perspective: { enable: true, mode: "toSecond", protectQuotes: true },
+     memory: { pruneThreshold: 15, minKeep: 5, tiers: { ephemeral: 1, core: 3, anchor: "Infinity" } },
+     performance: { enableMonitoring: true, maxExecutionTime: 100 },
+     debug: false
+   };
+   ```
+   
+   LICENSE: Compatible with original YINGXUE license
+   ===================================================================================== */
+
+(function() {
+  'use strict';
+
+  // Prevent double-loading
+  if (globalThis.YINGXUE_SUPER_PATCH_LOADED) {
+    console.warn('[YINGXUE SUPER PATCH] Already loaded, skipping');
+    return;
+  }
+
+  // ==================== CONSTANTS FRAMEWORK ====================
+  const YINGXUE_SUPER_CONST = {
+    // Core behavioral constants
+    engagement: {
+      baseDecay: 0.05,
+      maxLevel: 10,
+      boosts: { small: 0.5, medium: 1.0, large: 2.0 }
+    },
+    
+    tension: {
+      baseDecay: 0.03,
+      buildRates: { conflict: 1.5, intimate: 1.2, social: 0.8, casual: 0.4 },
+      maxLevel: 10
+    },
+    
+    emotion: {
+      momentumDecay: 0.1,
+      boostMultiplier: 0.6,
+      maxStrength: 5
+    },
+    
+    // Memory management
+    memory: {
+      pruneThreshold: 20,        // Start pruning when > this many characters
+      minKeep: 5,                // Always preserve at least this many
+      maxHistoryLength: 10,      // Trim character histories beyond this
+      tiers: {
+        ephemeral: 1,            // Prune first (temporary NPCs)
+        core: 3,                 // Medium priority (recurring characters)
+        anchor: Infinity         // Never prune (main characters)
+      }
+    },
+    
+    // Perspective normalizer
+    perspective: {
+      enable: true,
+      mode: "toSecond",          // "toFirst" | "toSecond"
+      protectQuotes: true,       // Don't normalize inside quoted speech
+      protectBrackets: true      // Don't normalize inside [brackets]
+    },
+    
+    // Performance monitoring
+    performance: {
+      enableMonitoring: false,
+      maxExecutionTime: 50,      // Warn if functions take longer than this (ms)
+      memoryCheckInterval: 10    // Check memory usage every N turns
+    },
+    
+    // Patch behavior
+    patch: {
+      enabled: true,
+      autoInit: true,
+      preserveOriginals: true
+    },
+    
+    // Debug settings
+    debug: false
+  };
+
+  // ==================== UTILITY FUNCTIONS ====================
+  
+  /**
+   * Deep merge utility - safely merges nested objects
+   */
+  function deepMerge(target, source, maxDepth = 10) {
+    if (maxDepth <= 0 || !source || typeof source !== 'object') return target;
+    
+    for (const key of Object.keys(source)) {
+      const srcVal = source[key];
+      const tgtVal = target[key];
+      
+      if (Array.isArray(srcVal)) {
+        target[key] = srcVal.slice();
+      } else if (srcVal && typeof srcVal === 'object' && srcVal.constructor === Object) {
+        if (!tgtVal || typeof tgtVal !== 'object') target[key] = {};
+        deepMerge(target[key], srcVal, maxDepth - 1);
+      } else {
+        target[key] = srcVal;
+      }
+    }
+    return target;
+  }
+
+  /**
+   * Performance monitor wrapper
+   */
+  function withPerformanceMonitoring(fn, name) {
+    return function(...args) {
+      if (!YINGXUE_SUPER_CONST.performance.enableMonitoring) {
+        return fn.apply(this, args);
+      }
+      
+      const start = performance.now();
+      try {
+        const result = fn.apply(this, args);
+        const duration = performance.now() - start;
+        
+        if (duration > YINGXUE_SUPER_CONST.performance.maxExecutionTime) {
+          console.warn(`[YINGXUE SUPER PATCH] ${name} took ${duration.toFixed(2)}ms (threshold: ${YINGXUE_SUPER_CONST.performance.maxExecutionTime}ms)`);
+        }
+        
+        return result;
+      } catch (error) {
+        const duration = performance.now() - start;
+        console.error(`[YINGXUE SUPER PATCH] ${name} failed after ${duration.toFixed(2)}ms:`, error);
+        throw error;
+      }
+    };
+  }
+
+  /**
+   * Safe logging utility
+   */
+  function debugLog(message, ...args) {
+    if (YINGXUE_SUPER_CONST.debug) {
+      console.log(`[YINGXUE SUPER PATCH] ${message}`, ...args);
+    }
+  }
+
+  // ==================== PERSPECTIVE NORMALIZER ====================
+  
+  /**
+   * Advanced perspective normalizer with comprehensive protection
+   * INTEGRATION NOTE: This overrides YX_HELPERS.normalizePronouns for enhanced swapping
+   */
+  function normalizePerspective(text, opts = {}) {
+    if (!text || typeof text !== 'string') return text;
+    
+    const config = {
+      enable: opts.enable ?? YINGXUE_SUPER_CONST.perspective.enable,
+      mode: opts.mode ?? YINGXUE_SUPER_CONST.perspective.mode,
+      protectQuotes: opts.protectQuotes ?? YINGXUE_SUPER_CONST.perspective.protectQuotes,
+      protectBrackets: opts.protectBrackets ?? YINGXUE_SUPER_CONST.perspective.protectBrackets
+    };
+    
+    if (!config.enable) return text;
+    
+    // Build protection regex
+    const protections = [];
+    if (config.protectQuotes) protections.push('"[^"]*"', "'[^']*'");
+    if (config.protectBrackets) protections.push('\\[[^\\]]*\\]');
+    
+    const protectionRegex = protections.length > 0 ? 
+      new RegExp(`(${protections.join('|')})`, 'g') : null;
+    
+    // Split text preserving protected segments
+    const segments = protectionRegex ? text.split(protectionRegex) : [text];
+    
+    // Define transformation patterns
+    const patterns = config.mode === "toFirst" ? [
+      ['you are', 'I am'],
+      ['you were', 'I was'],
+      ['you will', 'I will'],
+      ["you're", "I'm"],
+      ["you'll", "I'll"],
+      ["you've", "I've"],
+      ['you', 'I'],
+      ['your', 'my'],
+      ['yours', 'mine'],
+      ['yourself', 'myself']
+    ] : [
+      ['I am', 'you are'],
+      ['I was', 'you were'],
+      ['I will', 'you will'],
+      ["I'm", "you're"],
+      ["I'll", "you'll"],
+      ["I've", "you've"],
+      ['I', 'you'],
+      ['my', 'your'],
+      ['mine', 'yours'],
+      ['myself', 'yourself']
+    ];
+    
+    // Transform each segment
+    const normalized = segments.map((segment, index) => {
+      // Skip protected segments (odd indices when using split with capturing groups)
+      if (protectionRegex && index % 2 === 1) return segment;
+      
+      let result = segment;
+      patterns.forEach(([from, to]) => {
+        // Escape special regex characters and create word-boundary regex
+        const escapedFrom = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`\\b${escapedFrom}\\b`, 'gi');
+        
+        result = result.replace(regex, (match) => {
+          // Preserve original capitalization
+          if (match[0] === match[0].toUpperCase()) {
+            return to.charAt(0).toUpperCase() + to.slice(1);
+          }
+          return to;
+        });
+      });
+      
+      return result;
+    });
+    
+    return normalized.join('');
+  }
+
+  // Override base normalizer with super version
+  if (typeof YX_HELPERS !== 'undefined') {
+    YX_HELPERS.normalizePronouns = normalizePerspective;
+    debugLog('Base normalizePronouns overridden with advanced version');
+  }
+
+  // ==================== TIERED MEMORY PRUNING ====================
+  
+  /**
+   * Advanced memory pruning with tiered priorities and relationship preservation
+   * INTEGRATION NOTE: Enhances/overrides YX_HELPERS.pruneState for tiered logic
+   */
+  function pruneMemory(yxState = globalThis.state?.yingxue) {
+    if (!yxState || !yxState.characters) return yxState;
+    
+    try {
+      const characters = yxState.characters;
+      const charArray = Object.entries(characters).map(([name, char]) => ({
+        name,
+        ...char,
+        // Ensure required fields exist
+        memoryTier: char.memoryTier || 'core',
+        relationship: Number(char.relationship || char.rel || 0),
+        intimacy: Number(char.intimacy || char.int || 0),
+        lastSeen: Number(char.lastSeen || char.last || 0),
+        // Trim history if too long
+        history: Array.isArray(char.history) ? 
+          char.history.slice(-YINGXUE_SUPER_CONST.memory.maxHistoryLength) : []
+      }));
+      
+      const threshold = YINGXUE_SUPER_CONST.memory.pruneThreshold;
+      const minKeep = YINGXUE_SUPER_CONST.memory.minKeep;
+      
+      // If under threshold, just clean up histories and return
+      if (charArray.length <= threshold) {
+        const cleanedChars = Object.fromEntries(
+          charArray.map(char => {
+            const { name, ...charData } = char;
+            return [name, charData];
+          })
+        );
+        yxState.characters = cleanedChars;
+        return yxState;
+      }
+      
+      // Calculate tier priorities
+      const getTierPriority = (tier) => {
+        const priority = YINGXUE_SUPER_CONST.memory.tiers[tier];
+        if (priority === undefined) return 0; // Unknown tiers get lowest priority
+        return priority === Infinity ? Number.MAX_SAFE_INTEGER : Number(priority);
+      };
+      
+      // Sort characters by priority (tier first, then relationship strength)
+      const sortedChars = charArray.sort((a, b) => {
+        const tierPriorityA = getTierPriority(a.memoryTier);
+        const tierPriorityB = getTierPriority(b.memoryTier);
+        
+        if (tierPriorityA !== tierPriorityB) {
+          return tierPriorityB - tierPriorityA; // Higher priority first
+        }
+        
+        // Same tier - sort by relationship strength
+        const strengthA = a.relationship + a.intimacy + (a.lastSeen * 0.1);
+        const strengthB = b.relationship + b.intimacy + (b.lastSeen * 0.1);
+        return strengthB - strengthA; // Stronger relationships first
+      });
+      
+      // Keep top characters up to threshold, but at least minKeep
+      const keepCount = Math.max(minKeep, Math.min(threshold, sortedChars.length));
+      const keptChars = sortedChars.slice(0, keepCount);
+      
+      // Convert back to character object format
+      const prunedCharacters = Object.fromEntries(
+        keptChars.map(char => {
+          const { name, ...charData } = char;
+          return [name, charData];
+        })
+      );
+      
+      yxState.characters = prunedCharacters;
+      
+      const prunedCount = charArray.length - keptChars.length;
+      if (prunedCount > 0) {
+        debugLog(`Memory pruned: removed ${prunedCount} characters, kept ${keptChars.length}`);
+      }
+      
+      return yxState;
+      
+    } catch (error) {
+      console.error('[YINGXUE SUPER PATCH] Memory pruning failed:', error);
+      return yxState; // Return unchanged on error
+    }
+  }
+
+  // Enhance base pruneState with tiered logic
+  if (typeof YX_HELPERS !== 'undefined' && typeof YX_HELPERS.pruneState === 'function') {
+    const basePrune = YX_HELPERS.pruneState;
+    YX_HELPERS.pruneState = function(forceAggressive) {
+      basePrune(forceAggressive); // Run base first
+      pruneMemory(state.yingxue); // Then apply tiered
+    };
+    debugLog('Base pruneState enhanced with tiered pruning');
+  }
+
+  // ==================== STORY CARD INTEGRATION ====================
+  
+  /**
+   * Apply configuration overrides from story card
+   */
+  function applyStoryCardConfig(config = {}) {
+    try {
+      // Handle string "Infinity" values in tier configurations
+      if (config.memory?.tiers) {
+        const tiers = { ...config.memory.tiers };
+        Object.keys(tiers).forEach(key => {
+          const value = tiers[key];
+          if (typeof value === 'string' && 
+              (value.toLowerCase() === 'infinity' || value.toLowerCase() === 'inf')) {
+            tiers[key] = Infinity;
+          }
+        });
+        config.memory.tiers = tiers;
+      }
+      
+      // Deep merge configuration
+      deepMerge(YINGXUE_SUPER_CONST, config);
+      
+      debugLog('Story card configuration applied', config);
+      return true;
+    } catch (error) {
+      console.error('[YINGXUE SUPER PATCH] Failed to apply story card config:', error);
+      return false;
+    }
+  }
+
+  // ==================== AUTO-HOOKING SYSTEM ====================
+  
+  let originalFunctions = {};
+  
+  /**
+   * Safely hook into existing YINGXUE functions
+   */
+  function installHooks() {
+    if (!YINGXUE_SUPER_CONST.patch.enabled) {
+      debugLog('Auto-hooking disabled by configuration');
+      return false;
+    }
+    
+    let hooksInstalled = 0;
+    
+    // Hook INPUT function for perspective normalization
+    if (typeof globalThis.YINGXUE_INPUT === 'function' && !globalThis.YINGXUE_INPUT_SUPER_PATCHED) {
+      originalFunctions.YINGXUE_INPUT = globalThis.YINGXUE_INPUT;
+      
+      globalThis.YINGXUE_INPUT = withPerformanceMonitoring(function(text, meta) {
+        const normalized = normalizePerspective(text);
+        return originalFunctions.YINGXUE_INPUT(normalized, meta);
+      }, 'YINGXUE_INPUT');
+      
+      globalThis.YINGXUE_INPUT_SUPER_PATCHED = true;
+      hooksInstalled++;
+      debugLog('INPUT function hooked for perspective normalization');
+    }
+    
+    // Hook OUTPUT function for memory pruning
+    if (typeof globalThis.YINGXUE_OUTPUT === 'function' && !globalThis.YINGXUE_OUTPUT_SUPER_PATCHED) {
+      originalFunctions.YINGXUE_OUTPUT = globalThis.YINGXUE_OUTPUT;
+      
+      globalThis.YINGXUE_OUTPUT = withPerformanceMonitoring(function(text, meta) {
+        const result = originalFunctions.YINGXUE_OUTPUT(text, meta);
+        
+        // Prune memory after processing output
+        if (globalThis.state?.yingxue) {
+          pruneMemory(globalThis.state.yingxue);
+        }
+        
+        return result;
+      }, 'YINGXUE_OUTPUT');
+      
+      globalThis.YINGXUE_OUTPUT_SUPER_PATCHED = true;
+      hooksInstalled++;
+      debugLog('OUTPUT function hooked for memory pruning');
+    }
+    
+    debugLog(`Auto-hooking complete: ${hooksInstalled} functions patched`);
+    return hooksInstalled > 0;
+  }
+
+  /**
+   * Remove all hooks and restore original functions
+   */
+  function removeHooks() {
+    let hooksRemoved = 0;
+    
+    Object.keys(originalFunctions).forEach(funcName => {
+      if (globalThis[funcName] && originalFunctions[funcName]) {
+        globalThis[funcName] = originalFunctions[funcName];
+        delete globalThis[`${funcName}_SUPER_PATCHED`];
+        hooksRemoved++;
+      }
+    });
+    
+    originalFunctions = {};
+    debugLog(`Hooks removed: ${hooksRemoved} functions restored`);
+    return hooksRemoved;
+  }
+
+  // ==================== PUBLIC API ====================
+  
+  /**
+   * Initialize the super patch system
+   */
+  globalThis.YINGXUE_SUPER_PATCH_INIT = function(storyCardConfig = null) {
+    try {
+      debugLog('Initializing YINGXUE Super Patch v2.0...');
+      
+      // Apply story card configuration if provided
+      if (storyCardConfig) {
+        applyStoryCardConfig(storyCardConfig);
+      } else if (typeof globalThis.YINGXUE_PATCH_CONFIG !== 'undefined') {
+        // Look for global config object
+        applyStoryCardConfig(globalThis.YINGXUE_PATCH_CONFIG);
+      }
+      
+      // Install hooks if enabled
+      if (YINGXUE_SUPER_CONST.patch.enabled) {
+        installHooks();
+      }
+      
+      // Mark as loaded
+      globalThis.YINGXUE_SUPER_PATCH_LOADED = true;
+      
+      console.log('[YINGXUE SUPER PATCH] v2.0 initialized successfully');
+      return true;
+      
+    } catch (error) {
+      console.error('[YINGXUE SUPER PATCH] Initialization failed:', error);
+      return false;
+    }
+  };
+
+  /**
+   * Remove all patches and restore original state
+   */
+  globalThis.YINGXUE_SUPER_PATCH_REMOVE = function() {
+    removeHooks();
+    delete globalThis.YINGXUE_SUPER_PATCH_LOADED;
+    console.log('[YINGXUE SUPER PATCH] Removed successfully');
+  };
+
+  /**
+   * Manual perspective normalization (for testing/debugging)
+   */
+  globalThis.YINGXUE_NORMALIZE_PERSPECTIVE = normalizePerspective;
+
+  /**
+   * Manual memory pruning (for testing/debugging)
+   */
+  globalThis.YINGXUE_PRUNE_MEMORY = pruneMemory;
+
+  /**
+   * Get current patch status and configuration
+   */
+  globalThis.YINGXUE_SUPER_PATCH_STATUS = function() {
+    return {
+      loaded: !!globalThis.YINGXUE_SUPER_PATCH_LOADED,
+      config: JSON.parse(JSON.stringify(YINGXUE_SUPER_CONST)),
+      hooks: {
+        input: !!globalThis.YINGXUE_INPUT_SUPER_PATCHED,
+        output: !!globalThis.YINGXUE_OUTPUT_SUPER_PATCHED
+      },
+      originalFunctions: Object.keys(originalFunctions)
+    };
+  };
+
+  // ==================== TEST FRAMEWORK ====================
+  
+  /**
+   * Comprehensive test suite
+   */
+  globalThis.YINGXUE_TEST_SUPER_PATCH = function() {
+    console.log('=== YINGXUE SUPER PATCH TEST SUITE ===');
+    
+    let testsRun = 0;
+    let testsPassed = 0;
+    
+    function test(name, testFn) {
+      testsRun++;
+      try {
+        const result = testFn();
+        if (result) {
+          console.log(`✅ ${name}`);
+          testsPassed++;
+        } else {
+          console.log(`❌ ${name}: Test returned false`);
+        }
+      } catch (error) {
+        console.log(`❌ ${name}: ${error.message}`);
+      }
+    }
+    
+    // Test perspective normalization
+    test('Perspective normalization (I→you)', () => {
+      const input = "I'm going to see you tomorrow.";
+      const output = normalizePerspective(input, { mode: 'toSecond' });
+      return output === "You're going to see you tomorrow.";
+    });
+    
+    test('Perspective normalization with quotes', () => {
+      const input = 'I said "I think you\'re right" to my friend.';
+      const output = normalizePerspective(input, { mode: 'toSecond', protectQuotes: true });
+      return output.includes('"I think you\'re right"'); // Quote should be unchanged
+    });
+    
+    test('Memory tier parsing', () => {
+      const config = { memory: { tiers: { anchor: 'Infinity', core: '3' } } };
+      applyStoryCardConfig(config);
+      return YINGXUE_SUPER_CONST.memory.tiers.anchor === Infinity;
+    });
+    
+    test('Memory pruning simulation', () => {
+      const mockState = {
+        characters: {
+          'NPC1': { memoryTier: 'ephemeral', relationship: 1 },
+          'NPC2': { memoryTier: 'core', relationship: 3 },
+          'MainChar': { memoryTier: 'anchor', relationship: 5 }
+        }
+      };
+      
+      // Temporarily lower threshold for test
+      const originalThreshold = YINGXUE_SUPER_CONST.memory.pruneThreshold;
+      YINGXUE_SUPER_CONST.memory.pruneThreshold = 2;
+      
+      pruneMemory(mockState);
+      
+      // Restore original threshold
+      YINGXUE_SUPER_CONST.memory.pruneThreshold = originalThreshold;
+      
+      // Should keep anchor and highest core character
+      return Object.keys(mockState.characters).includes('MainChar');
+    });
+    
+    test('Hook installation check', () => {
+      return typeof globalThis.YINGXUE_INPUT === 'function' || 
+             typeof globalThis.YINGXUE_OUTPUT === 'function';
+    });
+    
+    console.log(`=== TEST RESULTS: ${testsPassed}/${testsRun} passed ===`);
+    return testsPassed === testsRun;
+  };
+
+  // ==================== AUTO-INITIALIZATION ====================
+  
+  // Auto-initialize if enabled and not in test mode
+  if (YINGXUE_SUPER_CONST.patch.autoInit && 
+      typeof window !== 'undefined' && 
+      !globalThis.YINGXUE_SUPER_PATCH_TEST_MODE) {
+    
+    // Delay initialization to ensure core YINGXUE is loaded
+    setTimeout(() => {
+      globalThis.YINGXUE_SUPER_PATCH_INIT();
+    }, 100);
+  }
+
+  console.log('[YINGXUE SUPER PATCH] v2.0 loaded successfully (integrated into base library)');
+
+})(); // End IIFE
+```
