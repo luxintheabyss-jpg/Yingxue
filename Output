@@ -1,0 +1,25 @@
+const modifier = (text) => {
+    // Core engine
+    if (typeof YINGXUE_OUTPUT === "function") {
+        try { text = YINGXUE_OUTPUT(text); } 
+        catch (e) { if (typeof safeLog === 'function') safeLog("Output Tab Error:", e && e.message); }
+    }
+
+    // Optional AutoCards integration (normalize safely)
+    if (typeof AutoCards === "function") {
+        try {
+            const res = AutoCards("output", text);
+            if (globalThis.YINGXUE_helpers && typeof YINGXUE_helpers.normalizeAutoCards === 'function') {
+                const [newText] = YINGXUE_helpers.normalizeAutoCards(res, text, false);
+                if (typeof newText === 'string') text = newText;
+            } else if (typeof res === 'string') {
+                text = res;
+            } else if (Array.isArray(res) && res.length) {
+                text = res[0];
+            }
+        } catch (e) { /* fail silently */ }
+    }
+
+    return { text };
+};
+modifier(text);
